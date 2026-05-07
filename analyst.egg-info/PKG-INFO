@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: analyst
+Version: 0.1.0
+Summary: 财经新闻深度分析引擎 — 从 indexagent 检索数据，LLM 驱动线索链发现与隐蔽信息推导
+Requires-Python: >=3.10
+Requires-Dist: aiosqlite>=0.20
+Requires-Dist: pydantic>=2.0
+Requires-Dist: numpy>=1.24
+Requires-Dist: faiss-cpu>=1.7
+Requires-Dist: httpx>=0.27
+Requires-Dist: loguru>=0.7
+Requires-Dist: click>=8.0
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: jinja2>=3.1
+Provides-Extra: openai
+Requires-Dist: openai>=1.0; extra == "openai"
+Provides-Extra: anthropic
+Requires-Dist: anthropic>=0.30; extra == "anthropic"

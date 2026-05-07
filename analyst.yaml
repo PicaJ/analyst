@@ -1,0 +1,81 @@
+# ============================================================
+# analyst 配置文件 — 所有可调参数
+# ============================================================
+
+# ── data: 数据路径 ──
+data_dir: ~/github_tradingpro/trading/data
+db_path: ""                 # 留空自动使用 data_dir/news.db
+index_dir: ""               # 留空自动使用 data_dir/vectors
+report_dir: ""              # 留空自动使用 data_dir/reports
+
+# ── llm: 大模型连接 ──
+llm_provider: glm       # openai / deepseek / anthropic / ollama
+llm_model: glm-4-flash
+llm_base_url: "https://open.bigmodel.cn/api/paas/v4/"
+llm_api_key: "7cbba58957db4b0e9ad0c433721916da.3WwNoBZtABIrACFm"              # 通过环境变量 LLM_API_KEY 设置
+llm_max_tokens: 4096
+llm_temperature: 0.3
+llm_timeout: 120.0           # 请求超时 (秒)
+llm_connect_timeout: 30.0    # 连接超时 (秒)
+
+# ── chain: 线索链构建 ──
+chain_max_depth: 5
+chain_time_window_days: 90
+chain_significance_filter: 0.3       # 低于此值的链被过滤
+chain_timeline_strength: 0.5         # 时间链连接强度
+chain_sector_strength: 0.6           # 板块传导链连接强度
+chain_anomaly_strength: 0.8          # 异常链连接强度
+chain_cross_strength: 0.7            # 实体交叉链连接强度
+chain_anomaly_significance: 0.8      # 异常链默认重要性
+chain_cross_base_significance: 0.6   # 交叉链基础重要性
+chain_cross_overlap_bonus: 0.1       # 交叉链重叠加分
+chain_cross_max_overlap: 4           # 交叉链重叠上限
+chain_burst_density_threshold: 0.5   # 消息爆发密度阈值 (条/小时)
+min_cluster_size: 3                  # 最小聚类大小
+insight_max_news: 50                 # 单次 LLM 分析最大新闻数
+
+# ── chain significance weights: 链重要性评分权重 ──
+chain_weight_source_priority: 0.3    # 来源权威度权重
+chain_weight_sentiment_polarity: 0.3 # 情绪极性权重
+chain_weight_urgency: 0.2            # 紧急度权重
+chain_weight_node_count: 0.2         # 节点数量权重
+chain_max_priority_divisor: 5.0      # 来源优先级归一化除数
+chain_node_count_normalizer: 10.0    # 节点数归一化除数
+
+# ── eval: 自评估器 ──
+quality_threshold: 0.65              # 质量通过阈值 (0~1)
+eval_weight_evidence: 0.25           # 证据覆盖率权重
+eval_weight_reasoning: 0.20          # 推理质量权重
+eval_weight_specificity: 0.20        # 具体性权重
+eval_weight_signal: 0.20             # 信号新颖性权重
+eval_weight_consistency: 0.15        # 自洽性权重
+eval_hallucination_penalty_per_flag: 0.1   # 单个幻觉标记扣分
+eval_hallucination_max_penalty: 0.3        # 幻觉最大扣分
+eval_coverage_multiplier: 2.0              # 覆盖率乘数
+eval_max_hallucination_flags: 5            # 最大幻觉标记数
+eval_pass_rate_threshold: 0.5              # 批量评估通过率阈值
+
+# ── query: 查询限制 ──
+query_limit_time_range: 200          # 时间范围查询返回上限
+query_limit_entity: 100              # 实体查询返回上限
+query_limit_urgent: 50               # 紧急新闻查询返回上限
+query_limit_timeline: 200            # 时间线查询返回上限
+query_limit_cross: 300               # 交叉链查询返回上限
+query_plan_limit: 500                # Plan 阶段扫描上限
+
+# ── search: 检索模式 ──
+search_mode: hybrid                  # hybrid(向量+关键词) / keyword / entity / time
+hybrid_alpha: 0.7                    # 向量权重 (0=纯关键词, 1=纯向量)
+
+# ── agent: 闭环 Agent ──
+max_iterations: 3                    # 最大 Refine 迭代次数
+expansion_factor: 1.5                # expand_context 策略的时间窗口扩展系数
+
+# ── harness: 调度器 ──
+circuit_breaker_threshold: 3         # 熔断阈值 (连续失败次数)
+
+# ── log: 日志 ──
+log_dir: ""                          # 留空自动使用 data_dir/logs/analyst
+log_level: INFO                      # DEBUG / INFO / WARNING / ERROR
+log_retention_days: "7 days"         # 全量日志保留
+log_error_retention_days: "14 days"  # 错误日志保留
