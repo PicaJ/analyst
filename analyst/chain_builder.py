@@ -169,7 +169,36 @@ _STOP_WORDS = frozenset(
     # 新闻标题高频泛词（非投资关键词）
     "联社 日电 中国 美国 市场 预期 增长 全球 经济 国内 "
     "其中 当日 当周 同比 环比 年率 季调 终值 初值 修正 "
-    "最新 今日 本周 近期 上周 上月 下月 下周".split()
+    "最新 今日 本周 近期 上周 上月 下月 下周 "
+    # jieba 分词常见碎片（不应作为投资实体）
+    "投资 研报 高端 商业 布局 核心 持续 加速 推进 推动 "
+    "引领 赋能 融合 转型 升级 赋能 领军 头部 深度 广度 "
+    "中信 建投 国泰 海通 华泰 招商 广发 申万 银河 中金 "
+    "伟达 英伟 谷歌 苹果 微软 特斯 亚马 奥多 拉里 "
+    "高质量 青年 引擎 致贺 时代 世纪 梦想 未来 世界 "
+    "观点 分析师 评论 解读 建议 洞察 视角 角度 "
+    "大幅 显著 明显 较快 稳步 强劲 亮眼 优异 "
+    "第一 第二 第三 每日 每周 每月 双周 单月 "
+    "重点 关键 热点 焦点 核心要点 重要 重大 "
+    "机构 券商 基金 保险 银行 私募 公募 "
+    "板块 概念 题材 赛道 主题 方向 风口 "
+    "产能 产量 出货 出货量 需求 供给 供应 "
+    "项目 工程 基地 园区 中心 平台 系统 "
+    "技术 方案 方案 产品 方案 解决方案 应用 场景 "
+    "标准 规范 指标 数据 信息 系统 平台 "
+    "合作 战略 伙伴 关系 协议 框架 谅解 "
+    "发展 创新 创新 创造 突破 领先 前沿 "
+    "服务 解决 支持 帮助 促进 提升 优化 "
+    "收入 利润 估值 市值 规模 份额 占比 "
+    "计划 规划 目标 愿景 战略 方向 路线 "
+    "指数 指标 基准 权重 成分 样本 调整 "
+    # 财务指标泛词 (匹配所有公司财报，不是投资主题)
+    "净利润 净利 营业收入 营收 毛利率 净利率 每股收益 "
+    "净资产 资产负债 现金流 同比增长 环比增长 "
+    "盈利 亏损 扭亏 减亏 增盈 派息 分红 送转 "
+    "财报 一季报 年报 半年报 季报 业绩快报 业绩预告 "
+    "财报季 披露期 业绩 业绩公告 业绩报告 季度报告 "
+    "Q1 Q2 Q3 Q4 ".split()
 )
 
 
@@ -1036,20 +1065,14 @@ class ChainBuilder:
         self._enrich_ts_codes(nodes)
 
         entity_map: Dict[str, List[ChainNode]] = defaultdict(list)
+        # 仅使用结构化字段，不使用标题关键词 (标题分词碎片太多噪声)
         for n in nodes:
-            has_entity = False
             for c in n.mentioned_companies:
-                if c not in _STOP_WORDS:
+                if c not in _STOP_WORDS and len(c) >= 2:
                     entity_map[c].append(n)
-                    has_entity = True
             for s in n.related_sectors:
-                if s not in _STOP_WORDS:
+                if s not in _STOP_WORDS and len(s) >= 2:
                     entity_map[s].append(n)
-                    has_entity = True
-            if not has_entity and n.title:
-                for kw in _extract_title_keywords(n.title):
-                    if kw not in _STOP_WORDS and len(kw) >= 2:
-                        entity_map[kw].append(n)
 
         # 预计算每个实体→新闻时间的映射（用于方向性检测）
         entity_times: Dict[str, List[Tuple[str, datetime]]] = {}
@@ -1068,24 +1091,20 @@ class ChainBuilder:
         processed: Set[str] = set()
 
         for entity, enodes in entity_map.items():
-            if len(enodes) < 2:
+            if len(enodes) < 3:
                 continue
 
             related_entities: Dict[str, int] = defaultdict(int)
             for n in enodes:
                 for c in n.mentioned_companies:
-                    if c != entity:
+                    if c != entity and c not in _STOP_WORDS and len(c) >= 2:
                         related_entities[c] += 1
                 for s in n.related_sectors:
-                    if s != entity:
+                    if s != entity and s not in _STOP_WORDS and len(s) >= 2:
                         related_entities[s] += 1
-                if n.title:
-                    for kw in _extract_title_keywords(n.title):
-                        if kw != entity:
-                            related_entities[kw] += 1
 
             for rel_entity, overlap in sorted(related_entities.items(), key=lambda x: -x[1]):
-                if overlap < 2:
+                if overlap < 4:
                     continue
 
                 pair_key = tuple(sorted([entity, rel_entity]))
@@ -1259,6 +1278,88 @@ class ChainBuilder:
 
     # ========== 内部方法 ==========
 
+    # ── 行情播报过滤关键词 ──
+    # 纯行情播报标题模式，无投资分析价值
+    _QUOTE_BROADCAST_PATTERNS = [
+        "站上", "跌破", "收涨", "收跌", "报收", "收报",
+        "涨幅扩大", "跌幅扩大", "涨超", "跌超",
+        "再创历史新高", "盘中创", "日内涨", "日内跌",
+        "直线拉升", "快速拉升", "直线跳水", "快速回落",
+        "行情直播", "行情中", "技术分析",
+        "筹码峰", "压力位", "支撑位",
+    ]
+
+    # 仅在标题中出现的行情播报短语（不在深度分析中出现的纯行情描述）
+    _BROADCAST_TITLE_PHRASES = [
+        # 期货行情
+        "转跌", "转涨", "跌幅收窄", "涨幅收窄",
+        "盘中波动", "期货涨", "期货跌",
+        "WTI", "布伦特", "现货",
+        "持仓更新", "持仓变化", "ETF持仓",
+        "交易量统计", "成交量放大",
+        # ETF 行情
+        "ETF涨", "ETF跌", "ETF资金",
+        "基金发行", "基金规模",
+        # 短线行情描述
+        "冲高回落", "探底回升",
+        "窄幅震荡", "宽幅震荡",
+        "主力资金", "北向资金", "资金流出", "资金流入",
+        "半日主力", "半日成交",
+        # 盘中简讯
+        "盘中异动", "盘中涨", "盘中跌",
+        "券商晨报", "券商研报", "晨会纪要",
+    ]
+
+    # 商品关键词的比喻用法排除模式
+    # 黄金/白银等词常作形容词使用(黄金通道/黄金五月/白银时代),
+    # 只有标题同时出现资产相关词才视为真正的商品/投资匹配
+    _COMMODITY_METAPHOR_RULES = {
+        "黄金": {
+            "must_have": ["金价", "黄金价格", "黄金期货", "黄金ETF", "黄金T+D",
+                          "购金", "售金", "金矿", "黄金股", "黄金珠宝",
+                          "黄金储备", "黄金交易", "黄金需求", "黄金供给",
+                          "国际金价", "上海金", "COMEX", "盎司",
+                          "黄金产量", "黄金开采", "黄金冶炼"],
+            "never_if": ["黄金通道", "黄金五月", "黄金时段", "黄金周", "黄金海岸",
+                         "黄金时间", "黄金档", "黄金法则", "黄金窗口", "黄金交叉",
+                         "黄金期", "黄金岁月", "黄金十年", "黄金一代"],
+        },
+        "白银": {
+            "must_have": ["银价", "白银价格", "白银期货", "白银ETF", "沪银",
+                          "银矿", "白银股", "国际银价", "COMEX白银",
+                          "白银产量", "白银需求", "白银供给"],
+            "never_if": ["白银时代", "白银利润"],
+        },
+        "火箭": {
+            "must_have": ["商业航天", "可回收", "火箭发动机", "火箭回收",
+                          "火箭发射", "火箭试飞", "运力", "卫星",
+                          "蓝箭", "星河", "天兵", "力箭", "快舟",
+                          "长征", "发射场", "发射台", "助推器"],
+            "never_if": ["火箭弹", "火箭炮", "导弹", "也门", "胡塞",
+                         "袭击", "轰炸", "拦截", "发射火箭弹"],
+        },
+        "矿": {
+            "must_have": ["锂矿", "稀土", "锂辉石", "碳酸锂", "氢氧化锂",
+                          "锂盐", "找矿", "探矿权", "采矿权",
+                          "锂价", "稀土价格", "钨价", "锡价",
+                          "矿权", "矿业", "矿产", "采选",
+                          "矿企", "矿企", "有色金属"],
+            "never_if": ["钙钛矿", "煤矿", "煤矿事故", "煤矿爆炸",
+                         "煤矿智能化", "煤矿安全", "矿产纠纷",
+                         "印度", "越南", "澳大利亚", "莫迪",
+                         "外交", "访问", "合作开发",
+                         "挖矿", "比特币", "加密货币"],
+        },
+    }
+    # 澄清公告关键词
+    _CLARIFICATION_KEYWORDS = [
+        "澄清", "不涉及", "无关联", "未开展", "未有",
+        "与本公司无关", "无关的", "未与",
+        "无关业务", "不存在关联", "未参与",
+        "未生产", "未销售", "不生产", "不销售",
+        "未用于", "未供应", "无业务",
+    ]
+
     def _filter_for_chain(
         self,
         items: List[Dict[str, Any]],
@@ -1267,10 +1368,13 @@ class ChainBuilder:
     ) -> List[Dict[str, Any]]:
         """统一过滤: 为链构建清洗数据
 
-        三层过滤:
-          1. 排除公告源 (eastmoney_notice/cninfo) — 合规文件不是市场信号
-          2. 排除常规合规文件 (即使来源不是公告源)
-          3. 关键词相关性 (entity 非空时) — 标题必须包含目标关键词(词边界匹配)
+        过滤层级:
+          1. 排除公告源 (eastmoney_notice/cninfo)
+          2. 排除常规合规文件
+          3. 排除澄清公告 (公司说"不涉及XX业务")
+          4. 排除纯行情播报 (只有价格数字，无投资分析)
+          5. 关键词相关性 (entity 非空时)
+          6. 同事件多源去重 (保留最高优先级源)
         """
         if not items:
             return items
@@ -1283,19 +1387,218 @@ class ChainBuilder:
             if item.get("source") in self._FILING_SOURCES:
                 continue
 
-            # Layer 2: 常规合规文件过滤 (非公告源也可能有合规标题)
+            title = item.get("title", "")
+
+            # Layer 2: 常规合规文件过滤
             if filter_kw:
-                title = item.get("title", "")
                 if any(kw in title for kw in filter_kw):
                     continue
 
+            # Layer 3: 澄清公告过滤 (公司说"不涉及XX"，零投资价值)
+            if any(kw in title for kw in self._CLARIFICATION_KEYWORDS):
+                continue
+
+            # Layer 4: 纯行情播报过滤
+            # 模式: 标题同时包含行情词和价格数字，但不包含"分析"/"解读"/"观点"等深度词
+            if self._is_quote_broadcast(title):
+                continue
+
             kept.append(item)
 
-        # Layer 3: 关键词相关性过滤 (entity 非空时)
+        # Layer 5: 关键词相关性过滤 (entity 非空时)
         if entity and kept:
             kept = self._filter_by_keyword_relevance(entity, kept, entity_type)
 
+        # Layer 6: 同事件多源去重
+        if kept:
+            kept = self._dedup_same_event(kept)
+
+        # Layer 7: 短时间窗口同源碎片去重 (同一事件30分钟内>3条只保留最佳)
+        if kept:
+            kept = self._dedup_time_clustered(kept, window_minutes=30)
+
         return kept
+
+    def _is_quote_broadcast(self, title: str) -> bool:
+        """判断是否为纯行情播报 (只有价格/行情描述，无投资分析)"""
+        import re
+
+        # 深度分析词 — 有这些的不是行情播报
+        depth_words = [
+            "分析", "解读", "观点", "影响", "原因", "逻辑", "策略",
+            "投资", "机会", "风险", "推荐", "预期", "催化", "驱动",
+            "受益", "利好", "利空", "行业", "产业链", "传导",
+            "财报", "业绩", "营收", "净利", "订单", "合同",
+            "政策", "发布", "批准", "获批", "中标", "签署", "合作",
+            "突破", "研发", "量产", "交付", "投产", "扩产", "签约",
+            "增持", "回购", "定增", "收购", "并购",
+            "产能", "招标", "供货", "供应", "需求", "供给",
+        ]
+        if any(w in title for w in depth_words):
+            return False
+
+        # 纯行情播报模式词 (无深度分析价值)
+        broadcast_phrases = [
+            # 价格行情
+            "站上", "跌破", "收涨", "收跌", "报收", "收报",
+            "涨幅扩大", "跌幅扩大", "涨超", "跌超",
+            "再创历史新高", "盘中创", "日内涨", "日内跌",
+            "直线拉升", "快速拉升", "直线跳水", "快速回落",
+            "行情直播", "行情中", "技术分析",
+            "筹码峰", "压力位", "支撑位",
+            # 板块行情播报
+            "板块走强", "板块走弱", "板块拉升", "板块跳水",
+            "板块大涨", "板块大跌", "板块活跃", "板块异动",
+            "全线大涨", "全线大跌", "全线飘红", "全线飘绿",
+            "集体涨停", "批量涨停", "掀涨停潮",
+            "ETF领涨", "ETF领跌", "ETF涨幅", "ETF跌幅",
+            # 指数行情
+            "指数涨", "指数跌", "指数高开", "指数低开",
+            "高开高走", "高开低走", "低开高走", "低开低走",
+            "午后拉升", "尾盘拉升", "尾盘跳水", "午后异动",
+            "两市成交", "成交额", "成交破",
+            # 通用的"行情快讯"标题
+            "行情播报", "午评", "收评", "盘前", "盘后快讯",
+            "异动拉升", "异动下跌", "短线拉升", "短线跳水",
+            # 交易所行情播报
+            "金交所", "上金所", "上海黄金交易所",
+            "开盘涨", "开盘跌", "开盘价",
+            # 涨跌停/资金流行情
+            "涨停板", "跌停板", "封板", "开板",
+            "主力净流入", "主力净流出", "净流入", "净流出",
+            "龙虎榜", "机构买入", "机构卖出",
+            # 趋势描述行情 (无增量信息)
+            "震荡上扬", "震荡下行", "震荡走高", "震荡走低",
+            "持续上行", "持续下行", "持续走高", "持续走低",
+            "股价创", "股价突破", "创阶段",
+            "板块回调", "板块分化",
+            # 涨跌连板
+            "连阳", "连阴", "连板", "三连板", "四连板",
+            "飙升", "暴涨", "暴跌", "闪崩",
+            # 概念股行情
+            "概念股拉升", "概念股活跃", "概念股大涨", "概念股大跌",
+            "概念股掀", "概念股批量", "概念股涨停", "概念股走强",
+        ]
+        if any(p in title for p in broadcast_phrases):
+            return True
+
+        # 仅标题中的行情短语 (不在深度分析中出现)
+        if any(p in title for p in self._BROADCAST_TITLE_PHRASES):
+            return True
+
+        # 典型行情播报: "XX涨X%"/"XX跌X%"
+        if re.search(r'[涨跌]\d+\.?\d*[％%]', title):
+            return True
+
+        # 有价格数字 + 无深度词 = 行情播报
+        has_price = bool(re.search(r'\d+\.?\d*[％%美元元点]', title))
+        if has_price and not any(w in title for w in depth_words):
+            # 但排除包含公司名/产品名的标题 (可能是业绩数据)
+            company_indicators = ["公司", "集团", "股份", "科技", "发布", "公告"]
+            if not any(w in title for w in company_indicators):
+                return True
+
+        return False
+
+    @staticmethod
+    def _dedup_same_event(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """同事件多源去重 — 保留最高优先级源
+
+        判断规则: 标题相似度>80% 视为同一事件，只保留 source_priority 最小的
+        """
+        if len(items) <= 1:
+            return items
+
+        result = []
+        for item in items:
+            title = item.get("title", "")
+            merged = False
+            for existing in result:
+                existing_title = existing.get("title", "")
+                # 简单相似度: 较短标题被较长标题包含的字符比例
+                shorter, longer = (title, existing_title) if len(title) <= len(existing_title) else (existing_title, title)
+                if len(shorter) < 6:
+                    continue
+                # 计算重叠字符数
+                overlap = sum(1 for c in shorter if c in longer)
+                similarity = overlap / len(shorter) if shorter else 0
+                if similarity > 0.8:
+                    # 同一事件: 保留优先级更高的
+                    if (item.get("source_priority", 5) < existing.get("source_priority", 5)):
+                        result.remove(existing)
+                        result.append(item)
+                    merged = True
+                    break
+            if not merged:
+                result.append(item)
+
+        return result
+
+    @staticmethod
+    def _dedup_time_clustered(items: List[Dict[str, Any]], window_minutes: int = 30) -> List[Dict[str, Any]]:
+        """短时间窗口内的同源新闻聚合去重
+
+        问题: 同一事件(如美联储官员讲话)在30分钟内被同一源拆成20+条碎片新闻,
+              导致链中充斥重复信息。
+        策略: 对同一 source, 在 window_minutes 内的新闻,
+              保留 source_priority 最高的那条, 其余去除。
+        """
+        if len(items) <= 1:
+            return items
+
+        from itertools import groupby as _groupby
+
+        # 按 source 分组
+        by_source: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for item in items:
+            by_source[item.get("source", "")].append(item)
+
+        result = []
+        for source, group in by_source.items():
+            if len(group) <= 2:
+                result.extend(group)
+                continue
+
+            # 按时间排序
+            def _sort_key(x):
+                try:
+                    return datetime.fromisoformat(x.get("publish_time", "")[:19])
+                except (ValueError, TypeError):
+                    return datetime.min
+
+            group.sort(key=_sort_key)
+
+            # 滑动窗口: 收集 window_minutes 内的新闻, 只保留 priority 最好的
+            i = 0
+            while i < len(group):
+                cluster = [group[i]]
+                try:
+                    t_start = datetime.fromisoformat(group[i].get("publish_time", "")[:19])
+                    j = i + 1
+                    while j < len(group):
+                        try:
+                            t_j = datetime.fromisoformat(group[j].get("publish_time", "")[:19])
+                            if (t_j - t_start).total_seconds() <= window_minutes * 60:
+                                cluster.append(group[j])
+                                j += 1
+                            else:
+                                break
+                        except (ValueError, TypeError):
+                            j += 1
+
+                    if len(cluster) > 3:
+                        # 保留 priority 最好的 (数字越小越好)
+                        best = min(cluster, key=lambda x: x.get("source_priority", 5))
+                        result.append(best)
+                        i = j
+                    else:
+                        result.append(group[i])
+                        i += 1
+                except (ValueError, TypeError):
+                    result.append(group[i])
+                    i += 1
+
+        return result
 
     def _filter_by_keyword_relevance(
         self,
@@ -1340,6 +1643,22 @@ class ChainBuilder:
         for item in items:
             title = item.get("title", "")
 
+            # 0. 商品比喻用法过滤 (如"黄金通道"不是投资新闻)
+            if entity in self._COMMODITY_METAPHOR_RULES:
+                rules = self._COMMODITY_METAPHOR_RULES[entity]
+                # 排除明确比喻用法的标题
+                if any(p in title for p in rules["never_if"]):
+                    continue
+                # 必须包含至少一个资产相关词
+                if not any(p in title for p in rules["must_have"]):
+                    # 但也检查结构化字段
+                    companies = " ".join(item.get("mentioned_companies") or [])
+                    sectors = " ".join(item.get("related_sectors") or [])
+                    ts_codes = item.get("ts_codes") or []
+                    if not any(p in companies or p in sectors for p in rules["must_have"]):
+                        if not ts_codes:
+                            continue
+
             # 1. 严格匹配: 英文短词必须词边界匹配
             if any(p.search(title) for p in strict_patterns):
                 kept.append(item)
@@ -1363,8 +1682,6 @@ class ChainBuilder:
                 ts_codes = item.get("ts_codes") or []
                 if any(entity in tc for tc in ts_codes):
                     kept.append(item)
-
-        return kept
 
         return kept
 
@@ -1489,7 +1806,9 @@ class ChainBuilder:
                 has_entity = True
             if not has_entity and n.title:
                 for kw in _extract_title_keywords(n.title):
-                    entity_nodes[kw].append(n)
+                    # 仅接受 3+ 字符的标题关键词 (2字符碎片太多噪声)
+                    if len(kw) >= 3:
+                        entity_nodes[kw].append(n)
 
         bursts = {}
         window_hours = max(window_days * 24, 1)
