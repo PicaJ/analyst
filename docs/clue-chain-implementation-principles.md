@@ -179,19 +179,45 @@ Step 7: 计算重要性评分
 
 #### 情绪漂移检测算法
 
-这是时间链的核心信号检测逻辑。系统遍历排序后的节点序列，对比相邻节点的情绪标注：
+时间链采用三层信号检测策略：
+
+**1. 硬反转检测（最高优先级）**
+
+遍历所有相邻节点，识别关键情绪模式：
 
 ```
-对每一对相邻节点 (i, i+1):
-    if 节点i情绪 != 节点i+1情绪:
-        记录一个"情绪转变"信号
-
-特殊模式识别:
-  neutral → positive/negative  → "从沉默到表态，值得关注"
-  positive → negative          → "利好转利空，重大反转信号"
+positive → negative  → "利好转利空，重大反转信号"
+neutral → positive/negative  → "从沉默到表态，值得关注"
 ```
 
-**原理**：在金融市场中，情绪转变往往预示着趋势拐点。一个公司从"无消息"突然变成"正面消息"意味着有新的积极因素出现；而从"正面"急转为"负面"则可能是重大利空信号的前兆。
+**2. 滑动窗口情绪分布变化检测**
+
+不再逐节点比较，而是用滑动窗口统计极性比例变化：
+
+```
+window_size = max(3, len(sentiments) // 4)
+step = max(1, window_size // 2)
+
+对每个窗口位置:
+    polar_rate = 窗口内 positive/negative 占比
+    if 极性比例变化 > 40%:
+        报告"情绪加剧"或"情绪缓和"信号
+```
+
+**原理**：逐节点比较会产生大量噪音（如 neutral→positive→neutral 的交替），而窗口统计只关注分布的显著变化，信号质量更高。
+
+**3. 沉默间隔检测**
+
+如果两个相邻节点之间有 ≥7 天的新闻空白期，报告"沉默间隔"信号：
+
+```
+if gap_days >= 7:
+    "沉默间隔: {gap_days}天无相关报道, 事件可能中断后重启"
+```
+
+**原理**：长时间沉默后的突然报道，往往意味着事件重启或有新进展，是重要的时间信号。
+
+所有信号按优先级排序（硬反转 > 沉默间隔 > 缓变），去重后保留 top 5。
 
 #### 重要性评分公式
 
@@ -259,9 +285,11 @@ sector_groups: Dict[str, List[ChainNode]] = defaultdict(list)
 for n in nodes:
     for s in n.related_sectors:
         sector_groups[s].append(n)
-    if not n.related_sectors:
-        sector_groups["未分类"].append(n)
+# 注意: 不再归入"未分类"——无板块标签的节点不参与传导分析,
+# 避免大量无标签节点污染传导路径
 ```
+
+**关键设计点**：无板块标签的节点不归入"未分类"组，直接跳过。这是因为"未分类"通常包含大量节点，如果参与传导分析，会从"未分类"发出大量无意义的传导信号。只有真正有板块归属的新闻才参与传导链构建。
 
 **原理**：每条新闻在入库时已经被 `collectagent` 标注了 `related_sectors` 字段。板块传导链利用这个结构化字段，将新闻按行业维度重新组织。如果一个节点关联了多个板块，它会同时出现在多个分组中——这反映了"一条新闻同时影响多个行业"的现实。
 
@@ -271,11 +299,16 @@ for n in nodes:
 for i in range(len(sector_timeline) - 1):
     t1, sector_a, _ = sector_timeline[i]
     t2, sector_b, _ = sector_timeline[i + 1]
+    # 同日不算传导——两个板块同一天首次出现新闻不算传导关系
+    if t1[:10] == t2[:10]:
+        continue
     signals.append(
         f"传导路径: {sector_a}({t1[:10]}) → {sector_b}({t2[:10]}), "
         f"{sector_b}可能存在滞后反应机会"
     )
 ```
+
+**防自环机制**：当一个节点同时关联两个板块时，该节点可能同时是 sector_a 的最新节点和 sector_b 的最早节点。系统会检查 `from_id == to_id` 的情况并跳过，避免形成自环边。
 
 **原理**：如果行业 A 在 5月1日 开始出现相关新闻，行业 B 在 5月3日 才开始出现，那么行业 B 的相关股票可能有 2 天的**滞后反应窗口**。这正是板块传导链要捕获的信号——在行业 B 的市场尚未完全反应之前，提前布局。
 
@@ -320,7 +353,7 @@ Step 5: 按节点数排序，取 Top 5
 
 #### 实体爆发检测算法（核心）
 
-这是异常链最关键的算法：
+这是异常链最关键的算法，采用**相对密度**判定爆发（而非绝对阈值），避免热门实体每次都被误判：
 
 ```
 1. 构建实体→节点映射:
@@ -329,26 +362,47 @@ Step 5: 按节点数排序，取 Top 5
      其次用 related_sectors 字段
      都为空时，从标题分词提取关键词
 
-2. 对每个实体，计算消息密度:
+2. 对每个实体，计算基线密度和实际密度:
    times = 该实体所有节点的发布时间（排序后）
    span_hours = (最晚时间 - 最早时间) / 3600
-   density = 消息数 / max(span_hours, 1)
+   window_hours = days × 24（整个查询窗口）
 
-3. 判定爆发:
-   if density >= chain_burst_density_threshold (0.5 条/小时):
-     标记为"爆发实体"
+   baseline_density = 消息数 / window_hours    ← 基线: 全窗口平均密度
+   actual_density = 消息数 / max(span_hours, 1) ← 实际: 聚集时段密度
+
+3. 计算相对密度:
+   if baseline_density > 0.001:
+     relative_density = actual_density / baseline_density
+   else:
+     relative_density = actual_density  ← 冷门实体用绝对密度兜底
+
+4. 判定爆发:
+   if relative_density >= chain_burst_density_threshold (默认 3.0):
+     标记为"爆发实体"（当前密度是基线的 3 倍以上）
 ```
 
-**density 计算示例**：
+**relative_density 计算示例**：
 
 ```
-实体 "特斯拉" 在过去 30 天内:
-  出现在 12 条新闻中
-  时间跨度: 最早 2024-05-01 08:00, 最晚 2024-05-01 20:00
-  span_hours = 12
-  density = 12 / 12 = 1.0 条/小时
-  threshold = 0.5
-  1.0 >= 0.5 → 判定为爆发 ✓
+示例 1 — 热门实体 "特斯拉" (30 天内 120 条新闻):
+  基线密度 = 120 / (30×24) = 0.167 条/小时
+  聚集时段: 12 条新闻集中在 12 小时内
+  actual_density = 12/12 = 1.0 条/小时
+  relative_density = 1.0 / 0.167 = 6.0
+  threshold = 3.0
+  6.0 >= 3.0 → 确实是爆发 ✓ (密度是平时 6 倍)
+
+示例 2 — 热门实体正常波动:
+  基线密度 = 0.167 条/小时
+  3 条新闻分散在 5 小时内
+  actual_density = 3/5 = 0.6 条/小时
+  relative_density = 0.6 / 0.167 = 3.6 → 刚过线，但不算强爆发
+
+示例 3 — 冷门实体真正爆发:
+  基线密度 = 3 / (30×24) = 0.004 条/小时
+  5 条新闻集中在 2 小时内
+  actual_density = 5/2 = 2.5 条/小时
+  relative_density = 2.5 / 0.004 = 625 → 极强爆发信号
 ```
 
 **原理**：在正常情况下，同一实体在数小时内的新闻密度是有限的。如果密度突然飙升，通常意味着：
@@ -588,7 +642,7 @@ max_entity_cross_chains: 20   # 交叉链最多 20 条
 | `chain_cross_base_significance` | 0.6 | 交叉链基础重要性 |
 | `chain_cross_overlap_bonus` | 0.1 | 交叉链重叠加分 |
 | `chain_cross_max_overlap` | 4 | 交叉链重叠上限 |
-| `chain_burst_density_threshold` | 0.5 | 异常链爆发密度阈值（条/小时） |
+| `chain_burst_density_threshold` | 3.0 | 异常链爆发相对密度阈值（当前密度/基线密度） |
 | `min_cluster_size` | 3 | 异常链最小聚类大小 |
 | `chain_weight_source_priority` | 0.3 | 评分: 来源权威度权重 |
 | `chain_weight_sentiment_polarity` | 0.3 | 评分: 情绪极性权重 |

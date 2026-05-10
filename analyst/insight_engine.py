@@ -47,6 +47,9 @@ SYSTEM_PROMPT = """你是一位专注于 A 股市场的资深投资分析师，�
   "confidence": 0.0-1.0,
   "investment_relevance": "high/medium/low",
   "time_horizon": "短期(1-5天)/中期(1-4周)/长期(1-6月)",
+  "logic_score": 0-100,
+  "chain_score": 0-100,
+  "chain_improvement": "对输入线索链的评价与优化建议",
   "key_findings": [
     {
       "finding": "发现描述",
@@ -64,15 +67,59 @@ SYSTEM_PROMPT = """你是一位专注于 A 股市场的资深投资分析师，�
   "risk_factors": ["风险因素"],
   "actionable_items": [
     {
-      "action": "具体操作建议（含推荐理由）",
+      "action": "具体操作建议",
       "urgency": "high/medium/low",
       "targets": ["000333.SZ", "601318.SH"],
-      "reason": "推荐该标的的具体原因"
+      "target_reasons": [
+        {
+          "code": "000333.SZ",
+          "reason": "推荐原因（简要总结）",
+          "main_business": "主营业务（公司核心业务是什么）",
+          "core_advantage": "核心竞争力（技术/渠道/成本等独特优势）",
+          "industry_position": "行业地位（是否为行业龙头，市场份额排名）",
+          "financial_highlight": "财报要点（最近一期财报的营收/净利润/增速等关键数据）",
+          "holder_structure": "股东结构（大股东持股比例、散户占比、近期是否有增减持）"
+        }
+      ]
     }
   ]
 }
 
-targets 必须是具体的 A 股代码（格式: 6位数字.SH 或 6位数字.SZ），优先从下方提供的"可用股票代码"中选取。如果新闻中不涉及任何 A 股公司，actionable_items 设为空数组 []。"""
+logic_score 评分标准（0-100）:
+  - 因果链条是否完整清晰（事件→行业→个股的传导路径是否每一步都有证据支撑）
+  - 证据是否来自新闻中的具体事实（而非推测或泛泛而谈）
+  - 逻辑是否自洽（各发现之间是否存在矛盾）
+  - 投资论点是否具有可操作性（而非"可能影响"等空话）
+  - 90+: 逻辑严密、证据充分、因果链完整
+  - 70-89: 逻辑基本合理、部分环节需要补充证据
+  - 50-69: 逻辑有断裂、但方向大致正确
+  - <50: 逻辑牵强、缺乏因果证据
+
+chain_score 评分标准（0-100）— 对输入线索链本身的质量评价:
+  - 新闻与主题的相关度（是否混入大量无关新闻）
+  - 时间线的连贯性（新闻之间是否有逻辑关联，还是单纯按时间堆叠）
+  - 信息密度（是否有价值的投资信号，还是充斥行情播报/公告噪声）
+  - 线索链主题是否准确（主题是否真实反映了新闻内容）
+  - 90+: 线索链质量优秀，新闻高度相关，逻辑连贯
+  - 70-89: 线索链质量良好，偶有噪声，整体可用
+  - 50-69: 线索链质量一般，相关度不足或噪声较多，需要优化
+  - <50: 线索链质量差，主题偏移或噪声占主导，建议重建
+
+chain_improvement 要求:
+  - 如果 chain_score < 90，必须给出具体的优化建议
+  - 指出线索链中存在的问题（如：哪些新闻不应出现在此链中、缺少哪些关键新闻、主题应如何调整）
+  - 建议应具体可执行，而非泛泛而谈
+
+每个 actionable_item 的 targets 数量不设上限，只要是"可用股票代码及公司信息"列表中与分析论点相关的股票都可以推荐，优先推荐产业链上下游或同板块中受益程度不同的标的。targets 必须按推荐强度从强到弱排列（最值得买入的排在最前面），target_reasons 也按相同顺序排列。
+根据你的专业知识，推荐与投资论点最相关的 A 股标的，确保股票代码和公司名称准确。
+
+target_reasons 是必须字段，对 targets 中的每个股票代码必须按以下5个维度详细说明:
+  1. main_business: 主营业务
+  2. core_advantage: 核心竞争力（技术/渠道/成本等独特优势）
+  3. industry_position: 行业地位（是否为行业龙头，市场份额排名）
+  4. financial_highlight: 财报要点（最近一期财报的营收/净利润/增速等关键数据）
+  5. holder_structure: 股东结构（大股东持股比例、散户占比、近期是否有增减持）
+如果新闻中不涉及任何 A 股公司，或没有与投资论点直接相关的股票，actionable_items 设为空数组 []。"""
 
 CHAIN_ANALYSIS_PROMPT = """请分析以下线索链，聚焦 A 股投资机会，生成具体可执行的投资建议。
 
@@ -83,9 +130,6 @@ CHAIN_ANALYSIS_PROMPT = """请分析以下线索链，聚焦 A 股投资机会�
 - 重要性评分: {significance}
 - 已发现的隐蔽信号: {hidden_signals}
 
-## 可用股票代码（这些股票在本链的新闻中出现）
-{available_ts_codes}
-
 ## 线索链中的新闻（按时间顺序）
 
 {news_list}
@@ -95,8 +139,12 @@ CHAIN_ANALYSIS_PROMPT = """请分析以下线索链，聚焦 A 股投资机会�
 重要提醒:
 - 只分析与 A 股投资直接相关的内容
 - 如果新闻内容与 A 股投资无关（如纯国际政治、社会新闻），给出 confidence=0.1, actionable_items=[]
-- actionable_items.targets 必须是具体的股票代码，优先从上方"可用股票代码"中选取
 - 禁止输出"相关板块代码"、"相关个股代码"等泛泛之词
+- 推荐的股票必须与投资论点直接相关
+- 每个 actionable_item 应推荐多只相关股票（2-5 只），涵盖产业链上下游或同板块不同环节
+- logic_score 必须给出，评分基于因果链条的完整性、证据充分性和逻辑自洽性
+- chain_score 必须给出，评分基于线索链中新闻的相关度、连贯性和信息密度
+- 如果 chain_score < 90，chain_improvement 必须给出具体优化建议
 
 请严格按照 JSON 格式输出分析结果。"""
 
@@ -179,7 +227,7 @@ class LLMClient:
         self.api_key = config.llm_api_key
         self.max_tokens = config.llm_max_tokens
         self.temperature = config.llm_temperature
-        self.max_retries = getattr(config, 'llm_max_retries', 2)
+        self.max_retries = config.llm_max_retries
         self._client: Optional[httpx.AsyncClient] = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -197,12 +245,37 @@ class LLMClient:
             self._client = None
 
     async def complete(self, system: str, user: str) -> str:
-        """调用 LLM 完成生成 (带超时和服务端错误重试)"""
+        """调用 LLM 完成生成
+
+        重试策略:
+          - 超时 (TimeoutException): 无限重试, 退避 2→4→8→16→30s
+          - 服务端错误 (5xx) / 限流 (429): 无限重试, 退避 5→10→20→30s
+          - 认证失败 (401/403) / 余额不足 (402) / 网络断开: 立即终止
+          - 单条链安全阀: 总重试时间超过 llm_per_chain_timeout 时放弃
+        """
+        import asyncio
+        import time
+
         logger.debug("LLM request: provider={}, model={}, system={} chars, user={} chars",
                       self.provider, self.model, len(system), len(user))
-        max_retries = self.max_retries
-        import asyncio
-        for attempt in range(max_retries + 1):
+
+        per_chain_timeout = self.config.llm_per_chain_timeout
+        start_time = time.monotonic()
+        attempt = 0
+
+        while True:
+            attempt += 1
+            elapsed = time.monotonic() - start_time
+
+            # 安全阀: 单条链总耗时超限
+            if elapsed > per_chain_timeout:
+                logger.error("LLM per-chain timeout ({:.0f}s exceeded), giving up after {} attempts: "
+                             "provider={}, model={}",
+                             per_chain_timeout, attempt, self.provider, self.model)
+                raise httpx.TimeoutException(
+                    f"Per-chain timeout ({per_chain_timeout}s) exceeded after {attempt} attempts"
+                )
+
             try:
                 if self.provider in _OPENAI_COMPAT_PROVIDERS or self.provider == "openai":
                     return await self._call_openai_compat(system, user)
@@ -212,41 +285,51 @@ class LLMClient:
                     return await self._call_ollama(system, user)
                 else:
                     raise ValueError(f"Unknown LLM provider: {self.provider}")
+
+            except httpx.TimeoutException:
+                # 超时: 无限重试, 指数退避 2→4→8→16→30s
+                wait = min(2 ** attempt, 30)
+                logger.warning("LLM timeout (attempt #{}, elapsed {:.0f}s), retrying in {}s: "
+                               "provider={}, model={}",
+                               attempt, elapsed, wait, self.provider, self.model)
+                await asyncio.sleep(wait)
+                continue
+
             except httpx.HTTPStatusError as e:
                 status = e.response.status_code
                 body = e.response.text[:500]
-                # 服务端错误 (5xx) 和限流 (429) 可重试
+
+                # 不可恢复: 认证失败 / 余额不足 → 立即终止
+                if status in (401, 402, 403):
+                    logger.error("LLM fatal error ({}): provider={}, model={}, body={}",
+                                 status, self.provider, self.model, body)
+                    raise
+
+                # 可恢复: 服务端错误 / 限流 → 无限重试
                 if status >= 500 or status == 429:
-                    if attempt < max_retries:
-                        wait = 5 * (attempt + 1)
-                        logger.warning("LLM server error {} (attempt {}/{}), retrying in {}s: "
-                                       "provider={}, model={}, body={}",
-                                       status, attempt + 1, max_retries + 1, wait,
-                                       self.provider, self.model, body)
-                        await asyncio.sleep(wait)
-                        continue
-                    logger.error("LLM API error after {} attempts: provider={}, model={}, "
-                                 "status={}, body={}",
-                                 max_retries + 1, self.provider, self.model, status, body)
-                else:
-                    logger.error("LLM API error: provider={}, model={}, status={}, body={}",
-                                 self.provider, self.model, status, body)
-                raise
-            except httpx.TimeoutException:
-                if attempt < max_retries:
-                    wait = 2 * (attempt + 1)
-                    logger.warning("LLM timeout (attempt {}/{}), retrying in {}s: provider={}, model={}",
-                                   attempt + 1, max_retries + 1, wait, self.provider, self.model)
+                    wait = min(5 * attempt, 30)
+                    logger.warning("LLM server error {} (attempt #{}, elapsed {:.0f}s), "
+                                   "retrying in {}s: provider={}, model={}, body={}",
+                                   status, attempt, elapsed, wait,
+                                   self.provider, self.model, body)
                     await asyncio.sleep(wait)
                     continue
-                logger.error("LLM API timeout after {} attempts: provider={}, model={}",
-                             max_retries + 1, self.provider, self.model)
+
+                # 其他客户端错误 (4xx) → 不重试
+                logger.error("LLM API error: provider={}, model={}, status={}, body={}",
+                             self.provider, self.model, status, body)
                 raise
+
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                # 网络断开 → 立即终止
+                logger.error("LLM connection failed (network down?): provider={}, model={}",
+                             self.provider, self.model)
+                raise
+
             except Exception as e:
                 logger.error("LLM call failed: provider={}, model={}, error={}: {}",
                              self.provider, self.model, type(e).__name__, e)
                 raise
-        raise httpx.TimeoutException("Max retries exceeded")
 
     def _resolve_base_url(self) -> str:
         """根据 provider 解析默认 base_url"""
@@ -290,7 +373,12 @@ class LLMClient:
         resp = await client.post(url, json=payload, headers=headers)
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        message = data["choices"][0]["message"]
+        content = message.get("content", "")
+        reasoning = message.get("reasoning_content", "")
+        if reasoning:
+            return f"<thinking>\n{reasoning}\n</thinking>\n\n{content}"
+        return content
 
     async def _call_anthropic(self, system: str, user: str) -> str:
         base = self._resolve_base_url()
@@ -342,6 +430,7 @@ class InsightEngine:
         self.config = config
         self.llm = LLMClient(config)
         self._critique: Optional[str] = None
+        self._stock_info_cache: Optional[Dict[str, Dict[str, str]]] = None
 
     def set_critique(self, critique: str):
         """设置批评意见 (用于 critique_revise 策略)"""
@@ -356,12 +445,26 @@ class InsightEngine:
                 f"请针对以下批评改进你的分析:\n{self._critique}\n"
             )
 
-        # 收集链中所有 ts_codes
+        # 收集链中所有 ts_codes（仅用于报告展示，不发给 LLM）
         all_ts_codes: set = set()
         for n in chain.nodes:
             for c in n.ts_codes:
                 all_ts_codes.add(c)
-        ts_codes_str = ", ".join(sorted(all_ts_codes)) if all_ts_codes else "无（本链新闻不涉及具体 A 股）"
+
+        # 加载股票真实信息，格式化为 "代码 → 公司名（行业）"
+        stock_info = self._load_stock_info_map()
+        ts_codes_lines = []
+        for code in sorted(all_ts_codes):
+            info = stock_info.get(code, {})
+            name = info.get("name", "")
+            industry = info.get("industry", "")
+            if name and industry:
+                ts_codes_lines.append(f"  {code} → {name}（{industry}）")
+            elif name:
+                ts_codes_lines.append(f"  {code} → {name}")
+            else:
+                ts_codes_lines.append(f"  {code}")
+        detected_stocks = "\n".join(ts_codes_lines) if ts_codes_lines else ""
 
         user_prompt = CHAIN_ANALYSIS_PROMPT.format(
             chain_type=chain.chain_type,
@@ -369,7 +472,6 @@ class InsightEngine:
             time_span=chain.time_span,
             significance=f"{chain.significance:.2f}",
             hidden_signals="; ".join(chain.hidden_signals) if chain.hidden_signals else "无",
-            available_ts_codes=ts_codes_str,
             news_list=_format_news_list(chain.nodes, self.config.insight_max_news),
             critique_section=critique_section,
         )
@@ -384,7 +486,10 @@ class InsightEngine:
             result["time_span"] = chain.time_span
             result["chain_theme"] = chain.theme
             result["llm_raw"] = raw
-            result["llm_input"] = user_prompt  # 保留 LLM 输入 prompt
+            result["llm_input"] = user_prompt
+            result["detected_stocks"] = detected_stocks  # 报告展示用
+            # 校验推荐股票信息准确性
+            result = self._verify_recommendations(result)
             return result
         except Exception as e:
             logger.error("LLM analysis failed for chain {}: {}", chain.chain_id, e)
@@ -402,7 +507,7 @@ class InsightEngine:
         import asyncio
         import time
 
-        semaphore = asyncio.Semaphore(5)
+        semaphore = asyncio.Semaphore(8)
         completed = asyncio.Event()
         done_count = 0
         total = len(chains)
@@ -425,6 +530,134 @@ class InsightEngine:
         results = list(results)
         results.sort(key=lambda r: r.get("confidence", 0), reverse=True)
         return results
+
+    def _load_stock_info_map(self) -> Dict[str, Dict[str, str]]:
+        """加载股票代码→{name, industry}映射 (从缓存文件)"""
+        if self._stock_info_cache is not None:
+            return self._stock_info_cache
+
+        from pathlib import Path as _P
+        data_dir = _P(self.config.data_dir)
+        result: Dict[str, Dict[str, str]] = {}
+
+        # 1. 行业缓存 (有 name + industry)
+        industry_path = data_dir / "stock_industry_cache.json"
+        if industry_path.exists():
+            try:
+                d = json.loads(industry_path.read_text(encoding="utf-8"))
+                for code, info in d.get("data", {}).items():
+                    suffix = ".SH" if code.startswith(("6", "5")) else ".SZ"
+                    ts_code = f"{code}{suffix}"
+                    result[ts_code] = {
+                        "name": info.get("name", ""),
+                        "industry": info.get("industry", ""),
+                    }
+            except Exception:
+                pass
+
+        # 2. ts_code_name 缓存 (补充名称)
+        name_path = data_dir / "cache" / "ts_code_name.json"
+        if name_path.exists():
+            try:
+                d = json.loads(name_path.read_text(encoding="utf-8"))
+                for ts_code, name in d.items():
+                    if ts_code not in result:
+                        result[ts_code] = {"name": name, "industry": ""}
+                    elif not result[ts_code].get("name"):
+                        result[ts_code]["name"] = name
+            except Exception:
+                pass
+
+        self._stock_info_cache = result
+        logger.debug("Loaded stock info map: {} entries", len(result))
+        return result
+
+    def _verify_recommendations(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """校验 LLM 推荐的股票信息是否与实际一致，过滤不匹配推荐
+
+        过滤规则:
+          1. 实际行业与分析论点不相关 → 过滤 (如白色家电 vs AI芯片)
+        """
+        stock_info = self._load_stock_info_map()
+        if not stock_info:
+            return result
+
+        thesis = result.get("thesis", "")
+        findings_text = " ".join(
+            f.get("finding", "") for f in result.get("key_findings", [])
+        )
+        analysis_text = f"{thesis} {findings_text}"
+
+        # 构建 industry_alias 关键词列表，用于模糊匹配
+        industry_alias = getattr(self.config, 'industry_alias', {})
+
+        for item in result.get("actionable_items", []):
+            valid_targets = []
+            valid_reasons = []
+            removed = []
+
+            for tr in item.get("target_reasons", []):
+                code = tr.get("code", "")
+
+                info = stock_info.get(code)
+                if not info or not info.get("name"):
+                    valid_reasons.append(tr)
+                    continue
+
+                actual_name = info["name"]
+                actual_industry = info.get("industry", "")
+                claimed_business = tr.get("main_business", "")
+
+                # 注入真实信息
+                tr["actual_name"] = actual_name
+                if actual_industry:
+                    tr["actual_industry"] = actual_industry
+
+                # 检查实际行业是否与分析论点相关
+                industry_relevant = False
+                if actual_industry:
+                    # 收集该行业的所有关联关键词 (行业名 + alias)
+                    keywords = set()
+                    keywords.add(actual_industry)
+                    for ind, aliases in industry_alias.items():
+                        if ind == actual_industry or actual_industry in aliases:
+                            keywords.update(aliases)
+                            keywords.add(ind)
+
+                    for kw in keywords:
+                        kw = kw.strip()
+                        if kw and kw in analysis_text:
+                            industry_relevant = True
+                            break
+
+                if not industry_relevant and actual_industry:
+                    # 实际行业在分析论点中未被提及，标记为不匹配
+                    tr["business_mismatch"] = True
+                    tr["business_mismatch_note"] = (
+                        f"LLM声称「{claimed_business}」，"
+                        f"实际为「{actual_name}」（{actual_industry}），与投资论点不匹配"
+                    )
+                    removed.append(tr)
+                    continue
+
+                valid_reasons.append(tr)
+                valid_targets.append(code)
+
+            if removed:
+                logger.warning(
+                    "Filtered {} mismatched stock recommendations: {}",
+                    len(removed),
+                    [f"{r['code']}({r.get('actual_name', '?')})" for r in removed],
+                )
+
+            # 更新为仅保留有效推荐
+            item["target_reasons"] = valid_reasons
+            if valid_targets:
+                item["targets"] = valid_targets
+            elif removed and not valid_reasons:
+                item["targets"] = []
+
+        return result
 
     def _parse_llm_response(self, raw: str) -> Dict[str, Any]:
         """解析 LLM 返回的 JSON (带容错)"""

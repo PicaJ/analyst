@@ -175,29 +175,41 @@ class AnalysisAgent:
         now_iso = datetime.utcnow().isoformat()
 
         # ── 分层扫描 ──
-        # 第一层: 快讯源（市场热点，全量获取，不截断）
+        # 第一层: 快讯源（市场热点，全量获取，并行查询）
+        import asyncio
+        flash_tasks = [
+            self.query.get_by_time_range(cutoff, now_iso, source=src, limit=50000)
+            for src in self._FLASH_SOURCES
+        ]
+        flash_results = await asyncio.gather(*flash_tasks, return_exceptions=True)
         flash_items = []
-        for src in self._FLASH_SOURCES:
-            try:
-                items = await self.query.get_by_time_range(
-                    cutoff, now_iso, source=src, limit=50000,
-                )
-                flash_items.extend(items)
-            except Exception as e:
-                logger.warning("[{}] Flash source '{}' query failed: {}", ctx.run_id, src, e)
+        for src, result in zip(self._FLASH_SOURCES, flash_results):
+            if isinstance(result, Exception):
+                logger.warning("[{}] Flash source '{}' query failed: {}", ctx.run_id, src, result)
+            else:
+                flash_items.extend(result)
         logger.info("[{}] Flash sources: {} items from {} sources",
                      ctx.run_id, len(flash_items), len(self._FLASH_SOURCES))
 
-        # 第二层: 公告源（eastmoney_notice/cninfo，取最近 5000 条）
+        # 第二层: 公告源（eastmoney_notice/cninfo，并行查询）
+        filing_tasks = [
+            self.query.get_by_time_range(cutoff, now_iso, source=src, limit=5000)
+            for src in self._FILING_SOURCES
+        ]
+        filing_results = await asyncio.gather(*filing_tasks, return_exceptions=True)
         filing_items = []
-        for src in self._FILING_SOURCES:
-            try:
-                items = await self.query.get_by_time_range(
-                    cutoff, now_iso, source=src, limit=5000,
-                )
-                filing_items.extend(items)
-            except Exception as e:
-                logger.warning("[{}] Filing source '{}' query failed: {}", ctx.run_id, src, e)
+        for src, result in zip(self._FILING_SOURCES, filing_results):
+            if isinstance(result, Exception):
+                logger.warning("[{}] Filing source '{}' query failed: {}", ctx.run_id, src, result)
+            else:
+                filing_items.extend(result)
+
+        # 过滤公告源中的常规合规文件 (内部控制、审计报告等，无投资价值)
+        filing_before = len(filing_items)
+        filing_items = self._filter_routine_filings(filing_items)
+        if len(filing_items) < filing_before:
+            logger.info("[{}] Filtered routine filings: {} → {}",
+                        ctx.run_id, filing_before, len(filing_items))
 
         # 合并: 快讯在前（优先被分析），公告补充
         recent = flash_items + filing_items
@@ -576,6 +588,15 @@ class AnalysisAgent:
         # 前置过滤: 跳过无投资价值的链（节省 LLM 调用）
         all_chains = self._filter_investment_irrelevant(all_chains)
 
+        # 总链数上限: 子主题分裂可能导致链数爆炸，按重要性保留 top N
+        max_total_chains = self.config.max_timeline_chains * 2
+        if len(all_chains) > max_total_chains:
+            all_chains.sort(key=lambda c: c.significance, reverse=True)
+            dropped = len(all_chains) - max_total_chains
+            all_chains = all_chains[:max_total_chains]
+            logger.info("[{}] Capped chains: {} → {} (dropped {} lowest-significance)",
+                        ctx.run_id, len(all_chains) + dropped, max_total_chains, dropped)
+
         logger.info("[{}] Built {} chains (after significance filter)",
                     ctx.run_id, len(all_chains))
 
@@ -758,6 +779,19 @@ class AnalysisAgent:
     @property
     def _NO_VALUE_KEYWORDS(self) -> frozenset:
         return frozenset(self.config.no_value_keywords)
+
+    def _filter_routine_filings(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """过滤公告源中的常规合规文件 (内部控制、审计报告等，无投资价值)"""
+        _FILING = {"eastmoney_notice", "cninfo"}
+        filter_kw = self.config.filing_filter_keywords
+        kept = []
+        for item in items:
+            if item.get("source") in _FILING:
+                title = item.get("title", "")
+                if any(kw in title for kw in filter_kw):
+                    continue
+            kept.append(item)
+        return kept
 
     def _filter_investment_irrelevant(self, chains: List[ClueChain]) -> List[ClueChain]:
         """前置过滤: 跳过无投资价值的链"""

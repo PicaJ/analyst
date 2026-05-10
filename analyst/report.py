@@ -44,25 +44,13 @@ REPORT_TEMPLATE = """\
 | 参数 | 值 | 说明 |
 |------|-----|------|
 | chain_significance_filter | {{ chain_significance_filter }} | 链重要性过滤阈值 (低于此值的链被丢弃) |
-| chain_max_nodes | {{ chain_max_nodes }} | 单链最大节点数 (超过时智能采样) |
 | min_cluster_size | {{ min_cluster_size }} | 最小聚类大小 |
 | hot_keyword_threshold | {{ hot_keyword_threshold }} | 高频词最低出现次数 |
+| chain_split_threshold | {{ chain_split_threshold }} | 超过此节点数时按子主题拆分 |
+| max_subtopic_chains | {{ max_subtopic_chains }} | 每个大链最多拆出的子链数 |
 | chain_time_window_days | {{ ctx.time_window_days }} | 时间窗口 (天) |
 | max_timeline_chains | {{ max_timeline_chains }} | timeline 链上限 |
 | max_sector_chains | {{ max_sector_chains }} | sector 链上限 |
-
-### 线索链详情
-
-| # | 链类型 | 主题 | 节点数 | 时间跨度 | 重要性 |
-|---|--------|------|--------|----------|--------|
-{%- for c in chains %}
-| {{ loop.index }} | {{ chain_type_labels.get(c.get("chain_type", ""), c.get("chain_type", "")) }} | {{ c.get("theme", "") }} | {{ c.get("node_count", 0) }} | {{ c.get("time_span", "-") }} | {{ "%.2f" | format(c.get("significance", 0)) }} |
-{%- endfor %}
-
-### 线索链新闻详情
-
-{%- for c in chains %}
-{%- endfor %}
 
 ---
 
@@ -80,10 +68,22 @@ REPORT_TEMPLATE = """\
 ## {{ loop.index }}. {{ ins.get("thesis", "未命名分析") }}
 
 - **置信度**: {{ "%.0f" | format(ins.get("confidence", 0) * 100) }}%
+- **逻辑评分**: {{ ins.get("logic_score", "-") }}/100
+- **线索链评分**: {{ ins.get("chain_score", "-") }}/100
 - **时间维度**: {{ ins.get("time_horizon", "未知") }}
 - **线索链类型**: {{ ins.get("chain_type", "未知") }}
 - **涉及新闻数**: {{ ins.get("node_count", 0) }} 条
 - **时间跨度**: {{ ins.get("time_span", "未知") }}
+{%- if ins.get("chain_improvement") %}
+
+### 线索链优化建议
+{{ ins.get("chain_improvement") }}
+{%- endif %}
+{%- if ins.get("detected_stocks") %}
+
+### 消息中搜索到的股票
+{{ ins.get("detected_stocks") }}
+{%- endif %}
 
 ### 核心发现
 {%- for finding in ins.get("key_findings", []) %}
@@ -140,40 +140,52 @@ REPORT_TEMPLATE = """\
 {%- elif item.get("targets") %}
   - 目标: {{ item.get("targets", []) | join(", ") }}
 {%- endif %}
-{%- if item.get("reason") %}
+{%- for tr in item.get("target_reasons", []) %}
+  - **{{ tr.get("code", "") }}**: {{ tr.get("reason", "") }}{% if tr.get("actual_name") %}（实际: {{ tr.get("actual_name") }}{% if tr.get("actual_industry") %}，{{ tr.get("actual_industry") }}{% endif %}）{% endif %}
+{%- if tr.get("main_business") %}
+    - 主营业务: {{ tr.get("main_business", "") }}{% if tr.get("actual_industry") and tr.get("actual_industry") not in tr.get("main_business", "") %} ⚠️ 实际行业: {{ tr.get("actual_industry") }}{% endif %}
+{%- endif %}
+{%- if tr.get("core_advantage") %}
+    - 核心竞争力: {{ tr.get("core_advantage", "") }}
+{%- endif %}
+{%- if tr.get("industry_position") %}
+    - 行业地位: {{ tr.get("industry_position", "") }}
+{%- endif %}
+{%- if tr.get("financial_highlight") %}
+    - 财报要点: {{ tr.get("financial_highlight", "") }}
+{%- endif %}
+{%- if tr.get("holder_structure") %}
+    - 股东结构: {{ tr.get("holder_structure", "") }}
+{%- endif %}
+{%- endfor %}
+{%- if item.get("reason") and not item.get("target_reasons") %}
   - 推荐理由: {{ item.get("reason") }}
 {%- endif %}
 {%- endfor %}
 {%- else %}
 （本分析暂无具体操作建议）
 {%- endif %}
+
+### LLM 分析详情
 {%- if ins.get("llm_raw") %}
 
-<details>
-<summary>LLM 分析原文</summary>
+**LLM 输出:**
 
 ```
 {{ ins.get("llm_raw", "") }}
 ```
-
-</details>
 {%- endif %}
 {%- if ins.get("llm_input") %}
 
-<details>
-<summary>LLM 输入 Prompt</summary>
+**LLM 输入:**
 
 ```
 {{ ins.get("llm_input", "") }}
 ```
-
-</details>
 {%- endif %}
 {%- endfor %}
 
 ---
-
-{% endfor %}
 
 ## 评估详情
 
@@ -282,7 +294,7 @@ def generate_report(ctx: RunContext, output_dir: str, config=None) -> str:
     tracking_hits = ctx.analysis_plan.get("scan_summary", {}).get("tracking_hits", [])
 
     # LLM 模型名
-    llm_model = f"{config.llm_model}" if config else "unknown"
+    llm_model = f"{config.llm_provider}/{config.llm_model}" if config else "unknown"
 
     # 构建评估维度表
     dim_names = {
@@ -338,6 +350,13 @@ def generate_report(ctx: RunContext, output_dir: str, config=None) -> str:
         chain_type_counts=chain_type_display,
         llm_model=llm_model,
         hot_keywords=hot_keywords,
+        hot_keyword_threshold=config.hot_keyword_threshold if config else 80,
+        chain_significance_filter=config.chain_significance_filter if config else 0.3,
+        min_cluster_size=config.min_cluster_size if config else 3,
+        chain_split_threshold=config.chain_split_threshold if config else 100,
+        max_subtopic_chains=config.max_subtopic_chains if config else 5,
+        max_timeline_chains=config.max_timeline_chains if config else 20,
+        max_sector_chains=config.max_sector_chains if config else 8,
         top_holders=top_holders,
         holders_end_date=holders_end_date or "N/A",
         chains=chains,

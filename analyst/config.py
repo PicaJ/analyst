@@ -41,6 +41,7 @@ class AnalystConfig:
     llm_timeout: float = 180.0
     llm_connect_timeout: float = 30.0
     llm_max_retries: int = 2
+    llm_per_chain_timeout: int = 300    # 单条链 LLM 分析总耗时安全阀 (秒)
 
     # ── chain ──
     chain_max_depth: int = 5
@@ -54,9 +55,10 @@ class AnalystConfig:
     chain_cross_base_significance: float = 0.6
     chain_cross_overlap_bonus: float = 0.1
     chain_cross_max_overlap: int = 4
-    chain_burst_density_threshold: float = 0.5
+    chain_burst_density_threshold: float = 3.0
     min_cluster_size: int = 3
-    chain_max_nodes: int = 100           # 单链最大节点数 (超过时智能采样保留最有价值的节点)
+    chain_split_threshold: int = 100      # 超过此节点数时按共现实体拆分为子主题链
+    max_subtopic_chains: int = 5          # 每个大链最多拆出的子链数
 
     # ── LLM 分析时的新闻展示策略 ──
     # insight_max_news: 传给 LLM 的最大新闻条数
@@ -151,6 +153,28 @@ class AnalystConfig:
         "共青团", "妇联", "工会", "精神文明", "荣誉称号", "表彰大会",
         "劳动模范", "先进工作者", "道德模范",
     ])
+    # 链构建停用词: 出现在新闻标题/实体中的泛词，不构成投资实体，不应建链
+    chain_stop_words: List[str] = field(default_factory=lambda: [
+        # 市场行情泛词
+        "研究", "五一", "假期", "加强", "举措", "历史", "新高", "涨幅", "扩大", "股价",
+        "走高", "走低", "大涨", "大跌", "反弹", "回落", "冲高", "震荡",
+        "上行", "下行", "走强", "走弱", "突破", "站上", "跌破", "触及", "收益",
+        # 公告标题泛词
+        "资金", "募集", "往来", "鉴证", "核查", "汇总", "专项", "存放",
+        "管理办法", "审计", "披露", "证监会", "深交所", "上交所",
+        # 公司治理泛词
+        "董事", "监事", "高管", "董秘", "法人", "董事长",
+        "国投", "中投", "议案", "提案", "任命", "辞职",
+        # 合规公告泛词
+        "内部控制", "自我评价", "自查", "评价报告", "内部审计",
+    ])
+    # 公告过滤关键词: 标题包含这些词的公告被视为常规合规文件，不参与链构建
+    filing_filter_keywords: List[str] = field(default_factory=lambda: [
+        "内部控制", "审计报告", "自我评价", "自查表",
+        "募集资金管理", "关联资金往来", "非经营性资金占用",
+        "管理办法", "工作制度", "鉴证报告", "核查意见",
+        "内部审计制度", "内部报告制度", "信息披露管理制度",
+    ])
     industry_alias: Dict[str, List[str]] = field(default_factory=lambda: {
         "航运": ["航运", "港口", "水上运输", "远洋", "海运", "船"],
         "航空": ["航空", "机场", "民航"],
@@ -180,6 +204,20 @@ class AnalystConfig:
         "传媒": ["传媒", "游戏", "影视", "广告"],
         "计算机": ["计算机", "软件", "IT", "信创", "人工智能", "AI"],
         "期货": ["期货", "白银", "沪银", "集运", "欧线"],
+    })
+    # 产业链传导关系图: 上游 → [下游行业列表]
+    # 用于板块传导链推导传导方向, 而非靠时间先后猜测
+    supply_chain_map: Dict[str, List[str]] = field(default_factory=lambda: {
+        "半导体": ["消费电子", "汽车", "通信", "计算机"],
+        "石油": ["化工", "航运", "汽车"],
+        "煤炭": ["电力", "钢铁", "化工"],
+        "钢铁": ["建材", "机械", "汽车"],
+        "有色金属": ["新能源", "汽车", "电子"],
+        "锂电": ["新能源", "汽车", "储能"],
+        "电力": ["有色", "化工", "钢铁"],
+        "化工": ["纺织", "医药", "农业"],
+        "机械": ["汽车", "建材", "军工"],
+        "粮食": ["食品", "白酒"],
     })
 
     # ── log ──

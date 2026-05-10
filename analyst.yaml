@@ -9,15 +9,24 @@ index_dir: ""               # 留空自动使用 data_dir/vectors
 report_dir: ""              # 留空自动使用 data_dir/reports
 
 # ── llm: 大模型连接 ──
-llm_provider: glm       # openai / deepseek / anthropic / ollama
-llm_model: glm-4-flash
-llm_base_url: "https://open.bigmodel.cn/api/paas/v4/"
-llm_api_key: "7cbba58957db4b0e9ad0c433721916da.3WwNoBZtABIrACFm"              # 通过环境变量 LLM_API_KEY 设置
+#glm
+# llm_provider: glm       # openai / deepseek / anthropic / ollama
+# llm_model: glm-4-flash
+# llm_base_url: "https://open.bigmodel.cn/api/paas/v4/"
+# llm_api_key: "7cbba58957db4b0e9ad0c433721916da.3WwNoBZtABIrACFm"              # 通过环境变量 LLM_API_KEY 设置
+
+#deepseek
+llm_provider: deepseek       # openai / deepseek / anthropic / ollama
+llm_model: deepseek-v4-pro
+llm_base_url: "https://api.deepseek.com"
+llm_api_key: "sk-0bea147c44df4714a1f5613b11b303c4"              # 通过环境变量 LLM_API_KEY 设置
+
 llm_max_tokens: 4096
 llm_temperature: 0.3
-llm_timeout: 60.0            # 请求超时 (秒)，快速失败重试
+llm_timeout: 90.0            # 请求超时 (秒)，快速失败重试
 llm_connect_timeout: 30.0    # 连接超时 (秒)
 llm_max_retries: 2           # 超时重试次数
+llm_per_chain_timeout: 300   # 单条链 LLM 分析总耗时安全阀 (秒)，超时则放弃该链
 
 # ── chain: 线索链构建 ──
 chain_max_depth: 5
@@ -31,9 +40,10 @@ chain_anomaly_significance: 0.8      # 异常链默认重要性
 chain_cross_base_significance: 0.6   # 交叉链基础重要性
 chain_cross_overlap_bonus: 0.1       # 交叉链重叠加分
 chain_cross_max_overlap: 4           # 交叉链重叠上限
-chain_burst_density_threshold: 0.5   # 消息爆发密度阈值 (条/小时)
+chain_burst_density_threshold: 3.0   # 消息爆发相对密度阈值 (当前密度/基线密度, ≥3.0 表示密度是平时3倍)
 min_cluster_size: 3                  # 最小聚类大小
-chain_max_nodes: 100                 # 单链最大节点数 (超过时智能采样保留最有价值的节点)
+chain_split_threshold: 100           # 超过此节点数时按共现实体拆分为子主题链
+max_subtopic_chains: 5               # 每个大链最多拆出的子链数
 insight_max_news: 50                 # 单次 LLM 分析最大新闻数
 
 # ── chain significance weights: 链重要性评分权重 ──
@@ -200,6 +210,88 @@ no_value_keywords:
   - 劳动模范
   - 先进工作者
   - 道德模范
+  - 亿美元
+  - 视频
+
+# ── chain stop words: 链构建停用词 ──
+# 出现在新闻标题/实体中的泛词，不构成投资实体，不应建链
+chain_stop_words:
+  - 研究
+  - 五一
+  - 假期
+  - 加强
+  - 举措
+  - 历史
+  - 新高
+  - 涨幅
+  - 扩大
+  - 股价
+  - 走高
+  - 走低
+  - 大涨
+  - 大跌
+  - 反弹
+  - 回落
+  - 冲高
+  - 震荡
+  - 上行
+  - 下行
+  - 走强
+  - 走弱
+  - 突破
+  - 站上
+  - 跌破
+  - 触及
+  - 收益
+  - 资金
+  - 募集
+  - 往来
+  - 鉴证
+  - 核查
+  - 汇总
+  - 专项
+  - 存放
+  - 管理办法
+  - 审计
+  - 披露
+  - 证监会
+  - 深交所
+  - 上交所
+  - 董事
+  - 监事
+  - 高管
+  - 董秘
+  - 法人
+  - 董事长
+  - 国投
+  - 中投
+  - 议案
+  - 提案
+  - 任命
+  - 辞职
+  - 内部控制
+  - 自我评价
+  - 自查
+  - 评价报告
+  - 内部审计
+
+# ── filing filter: 公告过滤关键词 ──
+# 标题包含这些词的公告被视为常规合规文件，不参与链构建
+filing_filter_keywords:
+  - 内部控制
+  - 审计报告
+  - 自我评价
+  - 自查表
+  - 募集资金管理
+  - 关联资金往来
+  - 非经营性资金占用
+  - 管理办法
+  - 工作制度
+  - 鉴证报告
+  - 核查意见
+  - 内部审计制度
+  - 内部报告制度
+  - 信息披露管理制度
 
 # ── industry alias: 行业别名映射 (用于业务匹配检测) ──
 industry_alias:
@@ -231,3 +323,16 @@ industry_alias:
   传媒: [传媒, 游戏, 影视, 广告]
   计算机: [计算机, 软件, IT, 信创, 人工智能, AI]
   期货: [期货, 白银, 沪银, 集运, 欧线]
+
+# ── supply chain map: 产业链传导关系图 (上游 → 下游) ──
+# 用于板块传导链推导传导方向, 而非靠时间先后猜测
+supply_chain_map:
+  半导体: [消费电子, 汽车, 通信, 计算机]
+  石油: [化工, 航运, 汽车]
+  煤炭: [电力, 钢铁, 化工]
+  钢铁: [建材, 机械, 汽车]
+  有色金属: [新能源, 汽车, 消费电子]
+  锂电: [新能源, 汽车, 储能]
+  电力: [有色金属, 化工, 钢铁]
+  化工: [纺织, 医药, 食品]
+  机械: [汽车, 建材, 军工]

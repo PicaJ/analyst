@@ -76,7 +76,6 @@ class ClueChain:
     links: List[ChainLink] = field(default_factory=list)
     significance: float = 0.0
     hidden_signals: List[str] = field(default_factory=list)
-    sampled_from: int = 0  # 采样前的原始节点数 (0 = 未采样)
 
     @property
     def time_span(self) -> str:
@@ -96,7 +95,6 @@ class ClueChain:
             "theme": self.theme,
             "significance": self.significance,
             "time_span": self.time_span,
-            "sampled_from": self.sampled_from,
             "node_count": self.node_count,
             "hidden_signals": self.hidden_signals,
             "nodes": [
@@ -154,9 +152,20 @@ _STOP_WORDS = frozenset(
     "之日起 交易日 收盘 价格 行使 权利 期权 激励 对象 限制性 股票 "
     "首次 公开 发行 上市 辅导 管理 制度 规则 办法 指引 指南 "
     "召开 会议 表决 投票 结果 有效 出席 委托 "
+    # 公司治理/人事泛词 (不应作为投资子主题)
+    "董事 监事 高管 董秘 法人 代表 副总 总经理 董事长 秘书 "
+    "国投 中投 持有 子公司 分公司 控股股东 实际控制人 "
+    "议案 提案 决议 任命 免职 辞职 任职 离任 变动 调整 "
     # 快讯通用词（非实体）
     "日内 后者 前者 已停 短线 盘中 报道 消息人士 据报道 "
     "续创 创新高 快速 拉升 涨幅扩大 跌幅扩大 直线 拉升 "
+    # 异常链/交叉链常见垃圾实体（从标题分词中混入的泛词）
+    "研究 五一 假期 加强 举措 历史 新高 涨幅 扩大 股价 "
+    "亿美元 走高 走低 大涨 大跌 反弹 回落 冲高 震荡 "
+    "上行 下行 走强 走弱 突破 站上 跌破 触及 收益 "
+    # 公告标题高频泛词（不应构成投资子主题）
+    "资金 募集 往来 鉴证 核查 汇总 专项 存放 使用情况 "
+    "管理办法 审计 报告 披露 证监会 深交所 上交所 "
     # 新闻标题高频泛词（非投资关键词）
     "联社 日电 中国 美国 市场 预期 增长 全球 经济 国内 "
     "其中 当日 当周 同比 环比 年率 季调 终值 初值 修正 "
@@ -192,9 +201,79 @@ def _count_title_keywords(items: List[Dict[str, Any]], top_n: int = 10) -> List[
 class ChainBuilder:
     """线索链构建器"""
 
+    # 公告源: 合规文件，不含市场信号，不参与链构建
+    _FILING_SOURCES = frozenset({"eastmoney_notice", "cninfo"})
+
     def __init__(self, config: AnalystConfig):
         self.config = config
         self.query = NewsQuery(config)
+        # 合并配置文件中的停用词到全局停用词集合
+        if config.chain_stop_words:
+            global _STOP_WORDS
+            _STOP_WORDS = _STOP_WORDS | frozenset(config.chain_stop_words)
+        # 股票名称 → ts_code 映射，用于补提取 ts_codes
+        self._stock_name_map: Dict[str, str] = {}
+        self._load_stock_name_map()
+
+    def _load_stock_name_map(self):
+        """加载 股票名称→ts_code 映射"""
+        from pathlib import Path as _P
+
+        data_dir = _P(self.config.data_dir)
+
+        # ts_code_name.json (主要来源: ~5000 条)
+        name_path = data_dir / "cache" / "ts_code_name.json"
+        if name_path.exists():
+            try:
+                d = json.loads(name_path.read_text(encoding="utf-8"))
+                for ts_code, name in d.items():
+                    if name:
+                        self._stock_name_map[name] = ts_code
+            except Exception:
+                pass
+
+        # stock_industry_cache.json (补充)
+        industry_path = data_dir / "stock_industry_cache.json"
+        if industry_path.exists():
+            try:
+                d = json.loads(industry_path.read_text(encoding="utf-8"))
+                for code, info in d.get("data", {}).items():
+                    name = info.get("name", "")
+                    if name and name not in self._stock_name_map:
+                        suffix = ".SH" if code.startswith(("6", "5")) else ".SZ"
+                        self._stock_name_map[name] = f"{code}{suffix}"
+            except Exception:
+                pass
+
+        logger.debug("Loaded stock name map: {} entries", len(self._stock_name_map))
+
+    def _enrich_ts_codes(self, nodes: List[ChainNode]) -> None:
+        """对 ts_codes 为空的节点，从标题中提取公司名并映射为股票代码"""
+        if not self._stock_name_map:
+            return
+
+        # 按名称长度降序排列，优先匹配长名称 (如"中国平安"优先于"平安")
+        sorted_names = sorted(self._stock_name_map.keys(), key=len, reverse=True)
+
+        for node in nodes:
+            if node.ts_codes:
+                continue
+            title = node.title
+            found_codes = []
+            matched_spans = []
+            for name in sorted_names:
+                if len(found_codes) >= 5:
+                    break
+                idx = title.find(name)
+                if idx >= 0:
+                    # 避免重叠匹配 (如"中国平安"匹配后不再匹配"平安")
+                    span = (idx, idx + len(name))
+                    if any(s <= span[0] < e or s < span[1] <= e for s, e in matched_spans):
+                        continue
+                    found_codes.append(self._stock_name_map[name])
+                    matched_spans.append(span)
+            if found_codes:
+                node.ts_codes = found_codes
 
     async def build_timeline_chain(
         self,
@@ -208,6 +287,9 @@ class ChainBuilder:
           - search_hybrid: FAISS 语义相关 + FTS5 关键词 → 高召回
           - get_timeline:  SQLite 标题 LIKE 匹配         → 不漏
         search_hybrid 失败时降级为纯 SQLite 查询。
+
+        当匹配结果超过 chain_split_threshold 时，自动按共现实体
+        拆分为多条子主题链，每条聚焦一个投资方向。
         """
         limit = self.config.query_limit_entity
 
@@ -229,55 +311,325 @@ class ChainBuilder:
         # 3. 合并去重
         items = _merge_dedup(hybrid_items, entity_items)
 
-        # 4. 智能采样 (节点过多时保留最有价值的)
-        original_count = len(items)
-        if original_count > self.config.chain_max_nodes:
-            items = self._sample_important_nodes(items, self.config.chain_max_nodes)
-            logger.info("Timeline chain '{}' sampled: {} → {} nodes",
-                        entity, original_count, len(items))
+        # 4. 统一过滤: 排除公告源 + 合规文件 + 关键词不相关
+        before_filter = len(items)
+        items = self._filter_for_chain(items, entity=entity, entity_type=entity_type)
+        if len(items) < before_filter:
+            logger.info("Timeline '{}': filtered {} → {} items",
+                        entity, before_filter, len(items))
 
         if len(items) < 2:
             return []
 
-        nodes = [ChainNode.from_dict(it) for it in items]
-        links = []
+        # 6. 子主题分裂: 匹配结果过多时按共现实体拆分
+        cfg = self.config
+        if len(items) > cfg.chain_split_threshold and cfg.max_subtopic_chains > 0:
+            subtopics = self._split_into_subtopics(entity, items, cfg.max_subtopic_chains)
+            if len(subtopics) >= 2:
+                logger.info("Timeline chain '{}' splitting: {} items → {} sub-topics",
+                            entity, len(items), len(subtopics))
+                return self._build_split_chains(entity, items, subtopics, entity_type, days)
 
+        # 5. 正常: 构建单条链
+        return [self._make_timeline_chain(entity, items, entity_type, days)]
+
+    # ========== timeline 链辅助方法 ==========
+
+    def _make_timeline_chain(
+        self,
+        entity: str,
+        items: List[Dict[str, Any]],
+        entity_type: str,
+        days: int,
+    ) -> ClueChain:
+        """从 items 构建单条 timeline 链 — 基于事件线索聚类
+
+        不再把所有新闻平铺为一条线，而是:
+          1. 用关键词重叠+时间窗口将新闻分为事件线索
+          2. 同一事件线索内的相邻节点才相连
+          3. link.reason 从数据推导而非写死
+        """
+        nodes = [ChainNode.from_dict(it) for it in items]
         nodes.sort(key=lambda n: n.publish_time or "")
-        for i in range(len(nodes) - 1):
-            n1, n2 = nodes[i], nodes[i + 1]
-            links.append(ChainLink(
-                from_id=n1.news_id,
-                to_id=n2.news_id,
-                link_type="temporal",
-                strength=self.config.chain_timeline_strength,
-                reason=f"同一{entity_type}({entity})的时间演变",
-            ))
+        self._enrich_ts_codes(nodes)
+
+        # 事件线索聚类
+        threads = self._cluster_event_threads(nodes)
+
+        links = []
+        thread_labels = []  # 用于 hidden_signals
+        for thread_idx, thread_nodes in enumerate(threads):
+            thread_label = self._label_event_thread(thread_nodes, entity)
+            thread_labels.append(thread_label)
+            for i in range(len(thread_nodes) - 1):
+                n1, n2 = thread_nodes[i], thread_nodes[i + 1]
+                reason = self._derive_link_reason(n1, n2, thread_label)
+                links.append(ChainLink(
+                    from_id=n1.news_id,
+                    to_id=n2.news_id,
+                    link_type="temporal",
+                    strength=self.config.chain_timeline_strength,
+                    reason=reason,
+                ))
 
         sentiment_shifts = self._detect_sentiment_shifts(nodes)
 
-        chain = ClueChain(
-            chain_id=f"timeline_{entity}_{datetime.utcnow().strftime('%Y%m%d')}",
+        # 如果检测到多条事件线索，报告为 hidden_signal
+        if len(thread_labels) > 1:
+            sentiment_shifts.insert(
+                0,
+                f"检测到{len(thread_labels)}条事件线索: {'; '.join(thread_labels[:3])}"
+            )
+
+        safe_id = entity.replace(" ", "_").replace("×", "_")[:40]
+        return ClueChain(
+            chain_id=f"timeline_{safe_id}_{datetime.utcnow().strftime('%Y%m%d')}",
             chain_type="timeline",
-            theme=f"{entity} 事件时间线 ({days}天)",
+            theme=f"{entity} 事件时间线 ({days}天, {len(threads)}条线索)",
             nodes=nodes,
             links=links,
             significance=self._calc_significance(nodes),
-            hidden_signals=sentiment_shifts,
-            sampled_from=original_count if original_count > self.config.chain_max_nodes else 0,
+            hidden_signals=sentiment_shifts[:5],
         )
-        return [chain]
+
+    # ── 事件线索聚类辅助方法 ──
+
+    def _cluster_event_threads(
+        self,
+        nodes: List[ChainNode],
+        gap_days: int = 3,
+        min_overlap: int = 2,
+    ) -> List[List[ChainNode]]:
+        """将节点按事件线索聚类
+
+        规则: 时间差 <= gap_days AND 标题关键词重叠 >= min_overlap → 同一事件线索
+        否则在两者之间断开，后续节点开始新线索。
+        """
+        if len(nodes) <= 2:
+            return [nodes]
+
+        # 预计算每个节点的标题关键词集合
+        node_keywords: List[Set[str]] = []
+        for n in nodes:
+            kws = set(_extract_title_keywords(n.title)) if n.title else set()
+            # 补充结构化字段作为关键词
+            for c in n.mentioned_companies:
+                if c not in _STOP_WORDS and len(c) >= 2:
+                    kws.add(c)
+            for s in n.related_sectors:
+                if s not in _STOP_WORDS and len(s) >= 2:
+                    kws.add(s)
+            node_keywords.append(kws)
+
+        # 事件断裂点检测
+        break_points = []
+        for i in range(len(nodes) - 1):
+            try:
+                t1 = datetime.fromisoformat(nodes[i].publish_time)
+                t2 = datetime.fromisoformat(nodes[i + 1].publish_time)
+                days_gap = (t2 - t1).days
+            except (ValueError, TypeError):
+                days_gap = 999
+
+            overlap = len(node_keywords[i] & node_keywords[i + 1])
+
+            # 断裂条件: 时间差太大 OR 关键词无重叠
+            if days_gap > gap_days and overlap < min_overlap:
+                break_points.append(i + 1)
+            elif days_gap > gap_days * 3:
+                # 超大间隔，强制断开
+                break_points.append(i + 1)
+
+        # 按断裂点切分
+        if not break_points:
+            return [nodes]
+
+        threads = []
+        prev = 0
+        for bp in break_points:
+            segment = nodes[prev:bp]
+            if segment:
+                threads.append(segment)
+            prev = bp
+        if prev < len(nodes):
+            threads.append(nodes[prev:])
+        return threads
+
+    def _label_event_thread(
+        self,
+        thread_nodes: List[ChainNode],
+        entity: str,
+    ) -> str:
+        """为事件线索生成简短标签
+
+        从线索中提取高频非停用关键词（排除 entity 本身）作为事件标签。
+        """
+        if not thread_nodes:
+            return "未知事件"
+
+        kw_counter: Dict[str, int] = {}
+        entity_lower = entity.lower()
+        for n in thread_nodes:
+            for kw in _extract_title_keywords(n.title or ""):
+                if kw.lower() != entity_lower and len(kw) >= 2:
+                    kw_counter[kw] = kw_counter.get(kw, 0) + 1
+
+        if not kw_counter:
+            # 用标题前 15 字作为兜底
+            return (thread_nodes[0].title or "未知事件")[:15]
+
+        top_kw = sorted(kw_counter, key=kw_counter.get, reverse=True)[:2]
+        return "+".join(top_kw)
+
+    def _derive_link_reason(
+        self,
+        n1: ChainNode,
+        n2: ChainNode,
+        thread_label: str,
+    ) -> str:
+        """从两个节点的标题推导连接原因"""
+        t1 = n1.title[:25] if n1.title else "?"
+        t2 = n2.title[:25] if n2.title else "?"
+        return f"[{thread_label}] {t1} → {t2}"
+
+    def _split_into_subtopics(
+        self,
+        entity: str,
+        items: List[Dict[str, Any]],
+        max_subtopics: int,
+    ) -> List[Tuple[str, List[Dict[str, Any]]]]:
+        """从大量匹配结果中提取共现实体，拆分为子主题
+
+        策略:
+          1. 优先从结构化字段 (mentioned_companies / related_sectors) 提取 — 精确可靠
+          2. 结构化字段不足时，用标题关键词补充
+          3. 对候选子主题去重: 覆盖新闻重叠度 >80% 的只保留一个
+
+        返回: [(子主题实体名, 匹配的新闻列表), ...]
+        """
+        from collections import Counter
+
+        entity_lower = entity.lower()
+
+        # ── Pass 1: 结构化字段 (高置信) ──
+        cooccur_structured: Counter = Counter()
+        entity_items_structured: Dict[str, List[Dict]] = defaultdict(list)
+
+        for item in items:
+            for c in (item.get("mentioned_companies") or []):
+                if c.lower() == entity_lower or c in _STOP_WORDS or len(c) < 2:
+                    continue
+                if entity_lower in c.lower() or c.lower() in entity_lower:
+                    continue
+                cooccur_structured[c] += 1
+                entity_items_structured[c].append(item)
+            for s in (item.get("related_sectors") or []):
+                if s.lower() == entity_lower or s in _STOP_WORDS or len(s) < 2:
+                    continue
+                if entity_lower in s.lower() or s.lower() in entity_lower:
+                    continue
+                cooccur_structured[s] += 1
+                entity_items_structured[s].append(item)
+
+        # ── Pass 2: 标题关键词 (补充) ──
+        cooccur_title: Counter = Counter()
+        entity_items_title: Dict[str, List[Dict]] = defaultdict(list)
+
+        for item in items:
+            title = item.get("title", "")
+            for kw in _extract_title_keywords(title):
+                kl = kw.lower()
+                if kl == entity_lower or kw in _STOP_WORDS or len(kw) < 2:
+                    continue
+                if entity_lower in kl or kl in entity_lower:
+                    continue
+                # 已在结构化字段中出现的不再重复
+                if kw in cooccur_structured:
+                    continue
+                cooccur_title[kw] += 1
+                entity_items_title[kw].append(item)
+
+        # ── 合并候选: 结构化优先，标题关键词补充 ──
+        all_candidates: List[Tuple[str, List[Dict[str, Any]]]] = []
+        for c, count in cooccur_structured.most_common():
+            if count >= 3:
+                all_candidates.append((c, entity_items_structured[c]))
+        for c, count in cooccur_title.most_common():
+            if count >= 3:
+                all_candidates.append((c, entity_items_title[c]))
+
+        # ── 去重: 覆盖新闻重叠度 >80% 的只保留一个 ──
+        selected: List[Tuple[str, List[Dict[str, Any]]]] = []
+        for sub_entity, sub_items in all_candidates:
+            sub_ids = set(it.get("id", "") for it in sub_items)
+            is_dup = False
+            for _, existing_items in selected:
+                existing_ids = set(it.get("id", "") for it in existing_items)
+                overlap = len(sub_ids & existing_ids) / min(len(sub_ids), len(existing_ids))
+                if overlap > 0.8:
+                    is_dup = True
+                    break
+            if not is_dup:
+                selected.append((sub_entity, sub_items))
+            if len(selected) >= max_subtopics:
+                break
+
+        return selected
+
+    def _build_split_chains(
+        self,
+        entity: str,
+        items: List[Dict[str, Any]],
+        subtopics: List[Tuple[str, List[Dict[str, Any]]]],
+        entity_type: str,
+        days: int,
+    ) -> List[ClueChain]:
+        """将大链拆为子主题链 + 剩余链
+
+        - 每个子主题: 主关键词 × 共现实体 → 独立 timeline 链
+        - 剩余: 未被子主题覆盖的新闻 → 保留在原链中
+        - 同一条新闻可以被多个子主题链包含 (不同投资视角)
+        """
+        chains: List[ClueChain] = []
+        covered_ids: Set[str] = set()
+
+        for sub_entity, sub_items in subtopics:
+            chain = self._make_timeline_chain(
+                entity=f"{entity}×{sub_entity}",
+                items=sub_items,
+                entity_type=entity_type,
+                days=days,
+            )
+            chains.append(chain)
+            covered_ids.update(it.get("id", "") for it in sub_items)
+            logger.debug("Sub-topic chain: {}×{} → {} nodes", entity, sub_entity, len(sub_items))
+
+        # 未被任何子主题覆盖的新闻 → 保留在原链
+        remaining = [it for it in items if it.get("id", "") not in covered_ids]
+        if len(remaining) >= 2:
+            chain = self._make_timeline_chain(
+                entity=entity,
+                items=remaining,
+                entity_type=entity_type,
+                days=days,
+            )
+            chains.append(chain)
+            logger.debug("Remaining chain: {} → {} nodes", entity, len(remaining))
+
+        logger.info("Split '{}' ({} items) → {} chains",
+                    entity, len(items), len(chains))
+        return chains
 
     async def build_sector_propagation_chain(
         self,
         policy_keywords: List[str],
         days: int = 90,
     ) -> List[ClueChain]:
-        """构建板块传导链 — 政策/事件从上游传导到下游行业
+        """构建板块传导链 — 基于产业链关系推导传导方向，用新闻数据验证
 
-        混合检索 + SQLite 关键词匹配合并，按 ID 去重:
-          - search_hybrid: FAISS 语义相关 + FTS5 关键词 → 高召回
-          - get_timeline:  SQLite 关键词 LIKE 匹配       → 不漏
-        search_hybrid 失败时降级为纯 SQLite 查询。
+        1. 从 policy_keywords 匹配 supply_chain_map 找到上下游关系
+        2. 在新闻数据中验证传导路径（上下游板块都有相关新闻）
+        3. 只保留有数据证据支持的传导路径
         """
         limit = self.config.query_limit_timeline
 
@@ -299,30 +651,158 @@ class ChainBuilder:
         # 3. 合并去重
         items = _merge_dedup(hybrid_items, timeline_items)
 
-        # 4. 智能采样 (节点过多时保留最有价值的)
-        original_count = len(items)
-        if original_count > self.config.chain_max_nodes:
-            items = self._sample_important_nodes(items, self.config.chain_max_nodes)
-            logger.info("Sector chain sampled: {} → {} nodes", original_count, len(items))
+        # 4. 统一过滤
+        items = self._filter_for_chain(items)
 
         if len(items) < 3:
             return []
 
         nodes = [ChainNode.from_dict(it) for it in items]
         nodes.sort(key=lambda n: n.publish_time or "")
+        self._enrich_ts_codes(nodes)
 
+        # 4. 板块分组
         sector_groups: Dict[str, List[ChainNode]] = defaultdict(list)
         for n in nodes:
             for s in n.related_sectors:
                 sector_groups[s].append(n)
-            if not n.related_sectors:
-                sector_groups["未分类"].append(n)
 
+        if len(sector_groups) < 2:
+            return []
+
+        # 5. 从 supply_chain_map 推导传导路径
+        scm = getattr(self.config, 'supply_chain_map', {})
+        propagation_paths = self._derive_propagation_paths(
+            sector_groups, scm, policy_keywords,
+        )
+
+        if not propagation_paths:
+            # 无产业链依据，退回基于时间排序（但加 warning）
+            logger.info("Sector chain: no supply_chain_map match, using time-based fallback")
+            return self._build_time_based_sector_chain(nodes, sector_groups, policy_keywords)
+
+        # 6. 构建基于产业链的传导链
+        links = []
+        signals = []
+        for upstream, downstream, lag_days, reason in propagation_paths:
+            upstream_nodes = sector_groups.get(upstream, [])
+            downstream_nodes = sector_groups.get(downstream, [])
+            if not upstream_nodes or not downstream_nodes:
+                continue
+
+            latest_up = max(upstream_nodes, key=lambda n: n.publish_time or "")
+            earliest_down = min(downstream_nodes, key=lambda n: n.publish_time or "")
+            if latest_up.news_id == earliest_down.news_id:
+                continue
+
+            links.append(ChainLink(
+                from_id=latest_up.news_id,
+                to_id=earliest_down.news_id,
+                link_type="sector",
+                strength=self.config.chain_sector_strength,
+                reason=reason,
+            ))
+            signals.append(
+                f"产业链传导: {upstream}(上游) → {downstream}(下游), "
+                f"预计滞后{lag_days}天, {downstream}存在滞后反应机会"
+            )
+
+        if not links:
+            return self._build_time_based_sector_chain(nodes, sector_groups, policy_keywords)
+
+        chain = ClueChain(
+            chain_id=f"sector_prop_{datetime.utcnow().strftime('%Y%m%d%H%M')}",
+            chain_type="sector_propagation",
+            theme=f"板块传导: {'/'.join(policy_keywords[:3])} (产业链驱动)",
+            nodes=nodes,
+            links=links,
+            significance=self._calc_significance(nodes),
+            hidden_signals=signals[:5],
+        )
+        return [chain]
+
+    # ── 板块传导链辅助方法 ──
+
+    def _derive_propagation_paths(
+        self,
+        sector_groups: Dict[str, List[ChainNode]],
+        supply_chain_map: Dict[str, List[str]],
+        policy_keywords: List[str],
+    ) -> List[Tuple[str, str, int, str]]:
+        """从 supply_chain_map 推导传导路径并用新闻数据验证
+
+        返回: [(上游板块, 下游板块, 滞后天数, 原因描述), ...]
+        """
+        paths = []
+        matched_upstreams: Set[str] = set()
+
+        # Step 1: policy_keywords 匹配 supply_chain_map 中的上游行业
+        for keyword in policy_keywords:
+            for upstream, downstreams in supply_chain_map.items():
+                # 关键词匹配上游行业名或其别名
+                aliases = self.config.industry_alias.get(upstream, [upstream])
+                if keyword in aliases or keyword == upstream:
+                    matched_upstreams.add(upstream)
+
+        # Step 2: 对每个上游，推导下游并验证
+        for upstream in matched_upstreams:
+            if upstream not in sector_groups:
+                continue
+            downstreams = supply_chain_map.get(upstream, [])
+            up_nodes = sector_groups[upstream]
+            up_first = self._earliest_time(up_nodes)
+            if not up_first:
+                continue
+
+            for downstream in downstreams:
+                if downstream not in sector_groups:
+                    continue
+                down_nodes = sector_groups[downstream]
+                down_first = self._earliest_time(down_nodes)
+                if not down_first:
+                    continue
+
+                # 计算滞后天数
+                try:
+                    t_up = datetime.fromisoformat(up_first)
+                    t_down = datetime.fromisoformat(down_first)
+                    lag_days = (t_down - t_up).days
+                except (ValueError, TypeError):
+                    lag_days = 0
+
+                # 只保留有方向性的传导（下游晚于上游，或同日但不同时）
+                if lag_days < 0:
+                    continue
+
+                # 找触发新闻标题
+                trigger_title = self._best_trigger_title(up_nodes)
+
+                reason = (
+                    f"产业链传导: {upstream}(上游)→{downstream}(下游), "
+                    f"触发[{trigger_title[:25]}]"
+                )
+                paths.append((upstream, downstream, max(lag_days, 0), reason))
+
+        return paths
+
+    def _build_time_based_sector_chain(
+        self,
+        nodes: List[ChainNode],
+        sector_groups: Dict[str, List[ChainNode]],
+        policy_keywords: List[str],
+    ) -> List[ClueChain]:
+        """退路: 无 supply_chain_map 匹配时，用时间排序（旧逻辑）"""
         sector_timeline = []
         for sector, sector_nodes in sector_groups.items():
-            first_time = min(n.publish_time for n in sector_nodes if n.publish_time)
+            valid_times = [n.publish_time for n in sector_nodes if n.publish_time]
+            if not valid_times:
+                continue
+            first_time = min(valid_times)
             sector_timeline.append((first_time, sector, sector_nodes))
         sector_timeline.sort()
+
+        if len(sector_timeline) < 2:
+            return []
 
         links = []
         for i in range(len(sector_timeline) - 1):
@@ -330,35 +810,49 @@ class ChainBuilder:
             _, sector_b, nodes_b = sector_timeline[i + 1]
             latest_a = max(nodes_a, key=lambda n: n.publish_time or "")
             earliest_b = min(nodes_b, key=lambda n: n.publish_time or "")
+            if latest_a.news_id == earliest_b.news_id:
+                continue
             links.append(ChainLink(
                 from_id=latest_a.news_id,
                 to_id=earliest_b.news_id,
                 link_type="sector",
                 strength=self.config.chain_sector_strength,
-                reason=f"板块传导: {sector_a} → {sector_b}",
+                reason=f"时序传导: {sector_a} → {sector_b} (无产业链依据)",
             ))
 
         propagation_signals = self._detect_propagation_signals(sector_timeline)
-
         chain = ClueChain(
             chain_id=f"sector_prop_{datetime.utcnow().strftime('%Y%m%d%H%M')}",
             chain_type="sector_propagation",
-            theme=f"板块传导: {'/'.join(policy_keywords[:3])}",
+            theme=f"板块传导: {'/'.join(policy_keywords[:3])} (时序推断)",
             nodes=nodes,
             links=links,
             significance=self._calc_significance(nodes),
             hidden_signals=propagation_signals,
-            sampled_from=original_count if original_count > self.config.chain_max_nodes else 0,
         )
         return [chain]
+
+    @staticmethod
+    def _earliest_time(nodes: List[ChainNode]) -> str:
+        times = [n.publish_time for n in nodes if n.publish_time]
+        return min(times) if times else ""
+
+    @staticmethod
+    def _best_trigger_title(nodes: List[ChainNode]) -> str:
+        """在板块节点中找到最佳触发新闻标题（优先级最高+最早的）"""
+        by_priority = sorted(nodes, key=lambda n: (n.source_priority, n.publish_time or ""))
+        return by_priority[0].title if by_priority else "未知事件"
 
     async def build_anomaly_chains(
         self,
         days: int = 30,
     ) -> List[ClueChain]:
-        """构建异常链 — 情绪/频率异常，可能暗示未公开信息
+        """构建异常链 — 触发点→爆发→扩散 三段式结构
 
-        优先使用快讯源，避免公告源噪音产生大量垃圾链。
+        1. 检测密度爆发（复用现有逻辑）
+        2. 在爆发窗口内定位触发点（最早的高优先级实质性新闻）
+        3. 区分爆发期和扩散期
+        4. 过滤掉无实质触发点的假异常（纯行情播报密度高）
         """
         items = await self.query.get_urgent(
             days=days,
@@ -367,62 +861,161 @@ class ChainBuilder:
         if not items:
             return []
 
-        # 只保留快讯源的节点，过滤公告源噪音
-        _FILING = {"eastmoney_notice", "cninfo"}
-        nodes = [
-            ChainNode.from_dict(it)
-            for it in items
-            if it.get("source") not in _FILING
-        ]
+        # 统一过滤: 排除公告源 + 合规文件
+        items = self._filter_for_chain(items)
+
+        nodes = [ChainNode.from_dict(it) for it in items]
         if len(nodes) < 3:
             return []
         nodes.sort(key=lambda n: n.publish_time or "")
+        self._enrich_ts_codes(nodes)
 
-        entity_bursts = self._detect_entity_bursts(nodes)
+        entity_bursts = self._detect_entity_bursts(nodes, window_days=days)
 
         chains = []
         for entity, burst_nodes in entity_bursts.items():
             if len(burst_nodes) < self.config.min_cluster_size:
                 continue
-            # 过滤掉停用词实体
             if entity in _STOP_WORDS or len(entity) < 2:
                 continue
 
-            links = []
-            for i in range(len(burst_nodes) - 1):
-                links.append(ChainLink(
-                    from_id=burst_nodes[i].news_id,
-                    to_id=burst_nodes[i + 1].news_id,
-                    link_type="anomaly",
-                    strength=self.config.chain_anomaly_strength,
-                    reason=f"异常聚集: {entity} 在短时间内出现{len(burst_nodes)}条相关消息",
-                ))
+            # 定位触发点
+            catalyst = self._find_catalyst(burst_nodes)
+            if not catalyst:
+                logger.debug("Anomaly '{}': no valid catalyst found, skipping", entity)
+                continue
+
+            # 构建三段式 links
+            links, signals = self._build_anomaly_links(entity, burst_nodes, catalyst, days)
 
             chain = ClueChain(
                 chain_id=f"anomaly_{entity}_{datetime.utcnow().strftime('%Y%m%d%H%M')}",
                 chain_type="anomaly",
-                theme=f"异常信号: {entity} 消息聚集",
+                theme=f"异常信号: {entity} 密度爆发",
                 nodes=burst_nodes,
                 links=links,
                 significance=self.config.chain_anomaly_significance,
-                hidden_signals=[
-                    f"{entity} 在{days}天内出现{len(burst_nodes)}条消息，密度异常",
-                    "可能存在未被市场充分反映的信息",
-                ],
+                hidden_signals=signals,
             )
             chains.append(chain)
 
         chains.sort(key=lambda c: c.node_count, reverse=True)
         return chains[:5]
 
+    # ── 异常链辅助方法 ──
+
+    _TICKER_WORDS = frozenset(
+        "盘中 涨幅扩大 跌幅扩大 直线拉升 快速拉升 拉升 "
+        "续创 创新高 站上 跌破 触及 "
+        "涨幅 跌幅 涨停 跌停 冲高 回落 震荡 走高 走低".split()
+    )
+
+    def _find_catalyst(self, burst_nodes: List[ChainNode]) -> Optional[ChainNode]:
+        """在爆发窗口内定位触发点
+
+        条件: 时间最早的前3条中，source_priority 最高且标题不是纯行情播报
+        """
+        if not burst_nodes:
+            return None
+
+        candidates = sorted(burst_nodes, key=lambda n: n.publish_time or "")[:5]
+
+        # 找非行情播报的高优先级节点
+        best = None
+        best_priority = 99
+        for n in candidates:
+            if any(w in (n.title or "") for w in self._TICKER_WORDS):
+                continue
+            if n.source_priority < best_priority:
+                best_priority = n.source_priority
+                best = n
+
+        return best
+
+    def _build_anomaly_links(
+        self,
+        entity: str,
+        burst_nodes: List[ChainNode],
+        catalyst: ChainNode,
+        window_days: int,
+    ) -> Tuple[List[ChainLink], List[str]]:
+        """构建 触发→爆发→扩散 三段式 links 和 signals"""
+        links = []
+        signals = []
+
+        try:
+            catalyst_time = datetime.fromisoformat(catalyst.publish_time)
+        except (ValueError, TypeError):
+            catalyst_time = None
+
+        # 划分阶段
+        catalyst_id = catalyst.news_id
+        burst_ids = []
+        diffusion_ids = []
+
+        for n in burst_nodes:
+            if n.news_id == catalyst_id:
+                continue
+            if not catalyst_time or not n.publish_time:
+                burst_ids.append(n.news_id)
+                continue
+            try:
+                n_time = datetime.fromisoformat(n.publish_time)
+                hours_from_catalyst = (n_time - catalyst_time).total_seconds() / 3600
+                if hours_from_catalyst <= 6:
+                    burst_ids.append(n.news_id)
+                else:
+                    diffusion_ids.append(n.news_id)
+            except (ValueError, TypeError):
+                burst_ids.append(n.news_id)
+
+        # 触发点信号
+        signals.append(
+            f"触发事件: {catalyst.title[:40]} ({catalyst.source})"
+        )
+        if burst_ids:
+            signals.append(
+                f"爆发期: {len(burst_ids)}条快讯在6小时内集中出现"
+            )
+        if diffusion_ids:
+            signals.append(
+                f"扩散期: {len(diffusion_ids)}条消息在爆发后继续扩散"
+            )
+
+        # 构建 links: catalyst → burst → diffusion
+        prev_id = catalyst_id
+        for n in sorted(
+            [n for n in burst_nodes if n.news_id != catalyst_id],
+            key=lambda n: n.publish_time or "",
+        ):
+            if n.news_id in burst_ids:
+                phase = "爆发"
+            elif n.news_id in diffusion_ids:
+                phase = "扩散"
+            else:
+                phase = "跟进"
+
+            links.append(ChainLink(
+                from_id=prev_id,
+                to_id=n.news_id,
+                link_type="anomaly",
+                strength=self.config.chain_anomaly_strength,
+                reason=f"{phase}: {entity} ({n.title[:25]})",
+            ))
+            prev_id = n.news_id
+
+        return links, signals
+
     async def build_entity_cross_chains(
         self,
         days: int = 60,
     ) -> List[ClueChain]:
-        """构建实体交叉链 — 不同实体/主题通过共同关联被串联
+        """构建实体交叉链 — 基于先导-滞后方向性检测
 
-        优先用实体字段，为空时从标题关键词提取。
-        过滤公告源噪音，只保留快讯源节点。
+        1. 共现检测（现有逻辑）
+        2. 时序方向性检测: A 的新闻是否系统性领先 B
+        3. 关系类型推断: 供应链/竞争/政策受益
+        4. 无方向性的共现丢弃
         """
         cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
         items = await self.query.get_by_time_range(
@@ -434,12 +1027,13 @@ class ChainBuilder:
         if len(items) < 3:
             return []
 
-        _FILING = {"eastmoney_notice", "cninfo"}
-        nodes = [
-            ChainNode.from_dict(it)
-            for it in items
-            if it.get("source") not in _FILING
-        ]
+        # 统一过滤: 排除公告源 + 合规文件
+        items = self._filter_for_chain(items)
+        if len(items) < 3:
+            return []
+
+        nodes = [ChainNode.from_dict(it) for it in items]
+        self._enrich_ts_codes(nodes)
 
         entity_map: Dict[str, List[ChainNode]] = defaultdict(list)
         for n in nodes:
@@ -452,11 +1046,23 @@ class ChainBuilder:
                 if s not in _STOP_WORDS:
                     entity_map[s].append(n)
                     has_entity = True
-            # 实体字段为空时从标题提取
             if not has_entity and n.title:
                 for kw in _extract_title_keywords(n.title):
                     if kw not in _STOP_WORDS and len(kw) >= 2:
                         entity_map[kw].append(n)
+
+        # 预计算每个实体→新闻时间的映射（用于方向性检测）
+        entity_times: Dict[str, List[Tuple[str, datetime]]] = {}
+        for entity, enodes in entity_map.items():
+            times = []
+            for n in enodes:
+                if n.publish_time:
+                    try:
+                        times.append((n.news_id, datetime.fromisoformat(n.publish_time)))
+                    except (ValueError, TypeError):
+                        pass
+            if times:
+                entity_times[entity] = sorted(times, key=lambda x: x[1])
 
         chains = []
         processed: Set[str] = set()
@@ -473,7 +1079,6 @@ class ChainBuilder:
                 for s in n.related_sectors:
                     if s != entity:
                         related_entities[s] += 1
-                # 标题关键词交叉
                 if n.title:
                     for kw in _extract_title_keywords(n.title):
                         if kw != entity:
@@ -493,6 +1098,22 @@ class ChainBuilder:
                 if not common_ids:
                     continue
 
+                # 方向性检测
+                direction_info = self._detect_lead_lag(
+                    entity, rel_entity, entity_times, common_ids,
+                )
+
+                # 无方向性的共现丢弃（只是被媒体打包报道）
+                if not direction_info:
+                    continue
+
+                leader, follower, avg_lead_hours, direction_ratio = direction_info
+
+                # 关系类型推断
+                rel_type = self._infer_relationship_type(
+                    entity, rel_entity, enodes,
+                )
+
                 chain_nodes = []
                 seen = set()
                 for n in enodes:
@@ -508,23 +1129,29 @@ class ChainBuilder:
                         to_id=chain_nodes[i + 1].news_id,
                         link_type="entity",
                         strength=self.config.chain_cross_strength,
-                        reason=f"实体交叉: {entity} ∩ {rel_entity}",
+                        reason=f"{rel_type}: {leader}(先导)→{follower}(滞后)",
                     ))
 
                 cfg = self.config
                 sig = (cfg.chain_cross_base_significance
                        + cfg.chain_cross_overlap_bonus * min(overlap, cfg.chain_cross_max_overlap))
 
+                # 用可读性更好的时间描述
+                if avg_lead_hours >= 24:
+                    lead_desc = f"{avg_lead_hours / 24:.1f}天"
+                else:
+                    lead_desc = f"{avg_lead_hours:.1f}小时"
+
                 chain = ClueChain(
-                    chain_id=f"cross_{entity}_{rel_entity}_{datetime.utcnow().strftime('%Y%m%d%H%M')}",
+                    chain_id=f"cross_{leader}_{follower}_{datetime.utcnow().strftime('%Y%m%d%H%M')}",
                     chain_type="entity_cross",
-                    theme=f"实体交叉: {entity} × {rel_entity}",
+                    theme=f"实体交叉: {leader}(先导) → {follower}(滞后)",
                     nodes=chain_nodes,
                     links=links,
                     significance=sig,
                     hidden_signals=[
-                        f"{entity} 与 {rel_entity} 出现{overlap}次共同报道",
-                        "两个实体的关联可能尚未被市场充分定价",
+                        f"{rel_type}: {leader} 平均领先 {follower} {lead_desc} (方向性比率{direction_ratio:.1f})",
+                        f"{follower} 可能存在滞后反应的投资窗口",
                     ],
                 )
                 chains.append(chain)
@@ -532,80 +1159,286 @@ class ChainBuilder:
         chains.sort(key=lambda c: c.significance, reverse=True)
         return chains[:10]
 
+    # ── 实体交叉链辅助方法 ──
+
+    def _detect_lead_lag(
+        self,
+        entity_a: str,
+        entity_b: str,
+        entity_times: Dict[str, List[Tuple[str, datetime]]],
+        common_ids: Set[str],
+    ) -> Optional[Tuple[str, str, float, float]]:
+        """检测两个实体之间的先导-滞后关系
+
+        返回: (先导者, 滞后者, 平均领先小时数, 方向性比率) 或 None (无方向性)
+        """
+        times_a = entity_times.get(entity_a, [])
+        times_b = entity_times.get(entity_b, [])
+        if len(times_a) < 2 or len(times_b) < 2:
+            return None
+
+        # 对每个 common_id 的时间，统计 A 领先 B 的次数
+        a_leads = 0
+        b_leads = 0
+        lead_hours_list: List[float] = []
+
+        # 构建时间映射
+        id_time_a = {nid: t for nid, t in times_a if nid in common_ids}
+        id_time_b = {nid: t for nid, t in times_b if nid in common_ids}
+
+        # 对共同新闻之外，用最近邻匹配 A 和 B 的新闻
+        all_times_a = [t for _, t in times_a]
+        all_times_b = [t for _, t in times_b]
+
+        # 简化方法: 对 A 的每条新闻，找 B 中时间最近且更晚的新闻
+        for t_a in all_times_a:
+            for t_b in all_times_b:
+                diff_hours = (t_b - t_a).total_seconds() / 3600
+                if 0 < diff_hours <= 72:  # B 在 A 之后 0-72 小时内
+                    a_leads += 1
+                    lead_hours_list.append(diff_hours)
+                    break  # 只取最近的一个 B
+
+        for t_b in all_times_b:
+            for t_a in all_times_a:
+                diff_hours = (t_a - t_b).total_seconds() / 3600
+                if 0 < diff_hours <= 72:
+                    b_leads += 1
+                    break
+
+        total = a_leads + b_leads
+        if total == 0:
+            return None
+
+        ratio = max(a_leads, b_leads) / total
+
+        # 方向性阈值: 需要至少 60% 的方向一致
+        if ratio < 0.6:
+            return None
+
+        avg_lead = sum(lead_hours_list) / len(lead_hours_list) if lead_hours_list else 0
+
+        if a_leads > b_leads:
+            return (entity_a, entity_b, avg_lead, ratio)
+        else:
+            return (entity_b, entity_a, avg_lead, ratio)
+
+    _REL_SUPPLY_WORDS = frozenset("供应 采购 原材料 上游 下游 供应商 订单 产能".split())
+    _REL_COMPETE_WORDS = frozenset("竞争 对标 市占率 份额 替代 抢占".split())
+    _REL_POLICY_WORDS = frozenset("政策 补贴 扶持 利好 规划 指导意见 支持".split())
+
+    def _infer_relationship_type(
+        self,
+        entity_a: str,
+        entity_b: str,
+        nodes_a: List[ChainNode],
+    ) -> str:
+        """从共现新闻标题推断关系类型"""
+        supply_hits = 0
+        compete_hits = 0
+        policy_hits = 0
+
+        for n in nodes_a[:10]:
+            title = n.title or ""
+            if any(w in title for w in self._REL_SUPPLY_WORDS):
+                supply_hits += 1
+            if any(w in title for w in self._REL_COMPETE_WORDS):
+                compete_hits += 1
+            if any(w in title for w in self._REL_POLICY_WORDS):
+                policy_hits += 1
+
+        scores = {
+            "供应链": supply_hits,
+            "竞争": compete_hits,
+            "政策受益": policy_hits,
+        }
+        best = max(scores, key=scores.get)
+        if scores[best] >= 1:
+            return best
+        return "关联"
+
     # ========== 内部方法 ==========
 
-    @staticmethod
-    def _sample_important_nodes(items: List[Dict[str, Any]], max_nodes: int) -> List[Dict[str, Any]]:
-        """智能采样: 保留最有价值的节点
+    def _filter_for_chain(
+        self,
+        items: List[Dict[str, Any]],
+        entity: Optional[str] = None,
+        entity_type: str = "keyword",
+    ) -> List[Dict[str, Any]]:
+        """统一过滤: 为链构建清洗数据
 
-        优先级: 有股票代码 > 来源权威度 > 时间分布多样性
+        三层过滤:
+          1. 排除公告源 (eastmoney_notice/cninfo) — 合规文件不是市场信号
+          2. 排除常规合规文件 (即使来源不是公告源)
+          3. 关键词相关性 (entity 非空时) — 标题必须包含目标关键词(词边界匹配)
         """
-        if len(items) <= max_nodes:
+        if not items:
             return items
 
-        selected_ids: Set[str] = set()
-        selected: List[Dict[str, Any]] = []
+        filter_kw = getattr(self.config, 'filing_filter_keywords', [])
+        kept = []
 
-        # 1. 优先保留有股票代码的 (投资价值最高)
-        for it in sorted(items, key=lambda x: -x.get("source_priority", 2)):
-            if len(selected) >= max_nodes:
-                break
-            if it.get("ts_codes"):
-                iid = it.get("id", "")
-                if iid and iid not in selected_ids:
-                    selected.append(it)
-                    selected_ids.add(iid)
+        for item in items:
+            # Layer 1: 公告源直接排除
+            if item.get("source") in self._FILING_SOURCES:
+                continue
 
-        # 2. 补充: 按天轮询, 每天取优先级最高的未选节点
-        if len(selected) < max_nodes:
-            day_items: Dict[str, List[Dict]] = defaultdict(list)
-            for it in items:
-                iid = it.get("id", "")
-                if iid in selected_ids:
+            # Layer 2: 常规合规文件过滤 (非公告源也可能有合规标题)
+            if filter_kw:
+                title = item.get("title", "")
+                if any(kw in title for kw in filter_kw):
                     continue
-                day = (it.get("publish_time") or "")[:10]
-                day_items[day].append(it)
-            for day_list in day_items.values():
-                day_list.sort(key=lambda x: -x.get("source_priority", 2))
 
-            days = sorted(day_items.keys())
-            round_idx = 0
-            while len(selected) < max_nodes:
-                added_any = False
-                for day in days:
-                    if len(selected) >= max_nodes:
-                        break
-                    dl = day_items[day]
-                    if round_idx < len(dl):
-                        it = dl[round_idx]
-                        iid = it.get("id", "")
-                        if iid not in selected_ids:
-                            selected.append(it)
-                            selected_ids.add(iid)
-                            added_any = True
-                if not added_any:
-                    break
-                round_idx += 1
+            kept.append(item)
 
-        selected.sort(key=lambda x: x.get("publish_time", ""))
-        return selected
+        # Layer 3: 关键词相关性过滤 (entity 非空时)
+        if entity and kept:
+            kept = self._filter_by_keyword_relevance(entity, kept, entity_type)
+
+        return kept
+
+    def _filter_by_keyword_relevance(
+        self,
+        entity: str,
+        items: List[Dict[str, Any]],
+        entity_type: str,
+    ) -> List[Dict[str, Any]]:
+        """关键词相关性过滤 — 用词边界匹配，避免子串误匹配
+
+        核心问题: 对 "AI" 用简单的 `in` 匹配会导致 "AIMCU"/"Chain" 误匹配。
+        改用正则词边界 \b 或字符类型边界检测。
+        """
+        import re
+
+        entity_lower = entity.lower()
+
+        # 收集关键词别名 (从 industry_alias 中查找)
+        keywords = {entity_lower}
+        for industry, alias_list in self.config.industry_alias.items():
+            if entity in alias_list or entity == industry:
+                keywords.update(a.lower() for a in alias_list)
+
+        # 为每个关键词构建匹配正则
+        # 对纯英文短词 (< 4 字符): 用非ASCII字母边界匹配，避免 "AIMCU"/"Chain" 误匹配
+        #   匹配条件: 关键词前面不是大写字母, 后面不是任何字母
+        #   这样 "AI" 匹配 "推动AI价格"(✓) "OpenAI发布"(✓) 但不匹配 "AIMCU"(✗) "Chain"(✗)
+        # 对中文/长词: 直接用 in 匹配
+        strict_patterns: List["re.Pattern"] = []
+        loose_keywords: List[str] = []
+
+        for kw in keywords:
+            if kw.isascii() and len(kw) <= 4:
+                # 关键词前面是小写字母(如OpenAI的'n') → 允许
+                # 关键词前面是大写字母(如AIMCU的'A') → 拒绝
+                # 关键词后面是任何字母 → 拒绝
+                pattern = r'(?:(?<=[a-z])|(?<![a-zA-Z]))' + re.escape(kw) + r'(?![a-zA-Z])'
+                strict_patterns.append(re.compile(pattern, re.IGNORECASE))
+            else:
+                loose_keywords.append(kw)
+
+        kept = []
+        for item in items:
+            title = item.get("title", "")
+
+            # 1. 严格匹配: 英文短词必须词边界匹配
+            if any(p.search(title) for p in strict_patterns):
+                kept.append(item)
+                continue
+
+            # 2. 宽松匹配: 中文/长词直接 in 匹配
+            title_lower = title.lower()
+            if any(kw in title_lower for kw in loose_keywords):
+                kept.append(item)
+                continue
+
+            # 3. 结构化字段匹配
+            companies = " ".join(item.get("mentioned_companies") or []).lower()
+            sectors = " ".join(item.get("related_sectors") or []).lower()
+            if entity_lower in companies or entity_lower in sectors:
+                kept.append(item)
+                continue
+
+            # 4. ts_codes 字段匹配 (仅 company 类型)
+            if entity_type == "company":
+                ts_codes = item.get("ts_codes") or []
+                if any(entity in tc for tc in ts_codes):
+                    kept.append(item)
+
+        return kept
+
+        return kept
 
     def _detect_sentiment_shifts(self, nodes: List[ChainNode]) -> List[str]:
-        signals = []
-        sentiments = [(n.publish_time, n.sentiment, n.title[:40]) for n in nodes if n.sentiment]
+        """检测情绪漂移和沉默间隔信号
 
+        1. 滑动窗口情绪分布变化检测: 窗口内极性比例突变才是真信号
+        2. 沉默间隔检测: 两个相邻节点之间有 ≥7 天空白，暗示事件中断或重启
+        """
+        signals: List[str] = []
+
+        # ── 沉默间隔检测 ──
+        sorted_nodes = sorted(
+            [n for n in nodes if n.publish_time],
+            key=lambda n: n.publish_time or "",
+        )
+        silence_threshold_days = 7
+        for i in range(len(sorted_nodes) - 1):
+            try:
+                t1 = datetime.fromisoformat(sorted_nodes[i].publish_time)
+                t2 = datetime.fromisoformat(sorted_nodes[i + 1].publish_time)
+                gap_days = (t2 - t1).days
+                if gap_days >= silence_threshold_days:
+                    signals.append(
+                        f"沉默间隔: {gap_days}天无相关报道 "
+                        f"({t1.strftime('%m-%d')}→{t2.strftime('%m-%d')}), "
+                        f"事件可能中断后重启"
+                    )
+            except (ValueError, TypeError):
+                pass
+
+        # ── 滑动窗口情绪漂移检测 ──
+        sentiments = [
+            (n.publish_time, n.sentiment)
+            for n in sorted_nodes if n.sentiment
+        ]
+        if len(sentiments) >= 4:
+            window_size = max(3, len(sentiments) // 4)
+            step = max(1, window_size // 2)
+            prev_polar_rate = -1.0
+            for start in range(0, len(sentiments) - window_size + 1, step):
+                window = sentiments[start:start + window_size]
+                polar_count = sum(
+                    1 for _, s in window if s in ("positive", "negative")
+                )
+                polar_rate = polar_count / len(window)
+                if prev_polar_rate >= 0 and abs(polar_rate - prev_polar_rate) > 0.4:
+                    direction = "加剧" if polar_rate > prev_polar_rate else "缓和"
+                    w_start = window[0][0][:10] if window[0][0] else "?"
+                    w_end = window[-1][0][:10] if window[-1][0] else "?"
+                    signals.append(
+                        f"情绪{direction}: 极性比例 {prev_polar_rate:.0%}→{polar_rate:.0%} "
+                        f"({w_start}~{w_end})"
+                    )
+                prev_polar_rate = polar_rate
+
+        # 保留最重要的信号，按优先级: 硬反转 > 沉默间隔 > 缓变
+        # 先标注硬反转 (positive→negative 这类关键模式)
         for i in range(len(sentiments) - 1):
-            _, s1, _ = sentiments[i]
-            _, s2, title2 = sentiments[i + 1]
-            if s1 != s2 and s1 and s2:
-                shift = f"情绪转变: {s1}→{s2}"
-                if s1 == "neutral" and s2 in ("positive", "negative"):
-                    shift += " (从沉默到表态，值得关注)"
-                elif s1 == "positive" and s2 == "negative":
-                    shift += " (利好转利空，重大反转信号)"
-                signals.append(shift)
+            _, s1 = sentiments[i]
+            _, s2 = sentiments[i + 1]
+            if s1 == "positive" and s2 == "negative":
+                signals.insert(0, "情绪反转: positive→negative (利好转利空，重大反转信号)")
+            elif s1 == "neutral" and s2 in ("positive", "negative"):
+                signals.insert(0, f"情绪激活: neutral→{s2} (从沉默到表态，值得关注)")
 
-        return signals[:5]
+        # 去重并截断
+        seen = set()
+        unique = []
+        for s in signals:
+            if s not in seen:
+                seen.add(s)
+                unique.append(s)
+        return unique[:5]
 
     def _detect_propagation_signals(
         self,
@@ -620,19 +1453,33 @@ class ChainBuilder:
             t2, sector_b, _ = sector_timeline[i + 1]
 
             if t1 and t2:
-                time_gap = t2[:10] if len(t2) >= 10 else t2
+                t1_date = t1[:10]
+                t2_date = t2[:10] if len(t2) >= 10 else t2
+                # 同日不算传导，跳过
+                if t1_date == t2_date:
+                    continue
                 signals.append(
-                    f"传导路径: {sector_a}({t1[:10]}) → {sector_b}({time_gap}), "
+                    f"传导路径: {sector_a}({t1_date}) → {sector_b}({t2_date}), "
                     f"{sector_b}可能存在滞后反应机会"
                 )
 
         return signals[:5]
 
-    def _detect_entity_bursts(self, nodes: List[ChainNode]) -> Dict[str, List[ChainNode]]:
-        """检测实体/主题爆发 (优先用实体字段，为空时从标题关键词提取)"""
+    def _detect_entity_bursts(
+        self,
+        nodes: List[ChainNode],
+        window_days: int = 30,
+    ) -> Dict[str, List[ChainNode]]:
+        """检测实体/主题爆发 — 基于相对密度 (当前密度 / 基线密度)
+
+        优先用实体字段，为空时从标题关键词提取。
+        基线密度 = 实体在整个时间窗口内的日均密度 (条/小时)。
+        爆发判定: relative_density >= chain_burst_density_threshold (默认 0.5,
+          但此时含义变为"当前密度是基线的 0.5 倍以上"这一阈值,
+          实际配置中建议 >= 3.0 表示"密度是平时 3 倍")。
+        """
         entity_nodes: Dict[str, List[ChainNode]] = defaultdict(list)
         for n in nodes:
-            # 优先用实体字段
             has_entity = False
             for c in n.mentioned_companies:
                 entity_nodes[c].append(n)
@@ -640,28 +1487,44 @@ class ChainBuilder:
             for s in n.related_sectors:
                 entity_nodes[s].append(n)
                 has_entity = True
-            # 实体字段为空时，从标题提取关键词
             if not has_entity and n.title:
                 for kw in _extract_title_keywords(n.title):
                     entity_nodes[kw].append(n)
 
         bursts = {}
+        window_hours = max(window_days * 24, 1)
+        cfg = self.config
+
         for entity, enodes in entity_nodes.items():
-            if len(enodes) < self.config.min_cluster_size:
+            if len(enodes) < cfg.min_cluster_size:
                 continue
-            times = []
+            times: List[datetime] = []
             for n in enodes:
                 if n.publish_time:
                     pt = n.publish_time
                     if isinstance(pt, str):
                         pt = datetime.fromisoformat(pt)
                     times.append(pt)
-            if len(times) >= 2:
-                times.sort()
-                span_hours = (times[-1] - times[0]).total_seconds() / 3600
-                density = len(times) / max(span_hours, 1)
-                if density >= self.config.chain_burst_density_threshold:
-                    bursts[entity] = enodes
+            if len(times) < 2:
+                continue
+
+            times.sort()
+            span_hours = (times[-1] - times[0]).total_seconds() / 3600
+
+            # 基线密度: 实体在整个时间窗口内的平均密度
+            baseline_density = len(times) / window_hours
+            # 实际爆发密度: 聚集时间段内的密度
+            actual_density = len(times) / max(span_hours, 1)
+
+            # 相对密度: 当前密度是基线的多少倍
+            # 避免除零: 基线极低时用固定阈值兜底
+            if baseline_density > 0.001:
+                relative_density = actual_density / baseline_density
+            else:
+                relative_density = actual_density  # 冷门实体直接用绝对密度
+
+            if relative_density >= cfg.chain_burst_density_threshold:
+                bursts[entity] = enodes
 
         return bursts
 
