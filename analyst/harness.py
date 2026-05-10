@@ -199,5 +199,5 @@ class Harness:
         generate_json_report(ctx, report_dir)
 
         if ctx.state == AgentState.COMPLETE and ctx.insights:
-            path = generate_report(ctx, report_dir)
+            path = generate_report(ctx, report_dir, config=self.config)
             ctx.report_path = path

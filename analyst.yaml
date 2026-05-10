@@ -15,8 +15,9 @@ llm_base_url: "https://open.bigmodel.cn/api/paas/v4/"
 llm_api_key: "7cbba58957db4b0e9ad0c433721916da.3WwNoBZtABIrACFm"              # 通过环境变量 LLM_API_KEY 设置
 llm_max_tokens: 4096
 llm_temperature: 0.3
-llm_timeout: 120.0           # 请求超时 (秒)
+llm_timeout: 60.0            # 请求超时 (秒)，快速失败重试
 llm_connect_timeout: 30.0    # 连接超时 (秒)
+llm_max_retries: 2           # 超时重试次数
 
 # ── chain: 线索链构建 ──
 chain_max_depth: 5
@@ -32,6 +33,7 @@ chain_cross_overlap_bonus: 0.1       # 交叉链重叠加分
 chain_cross_max_overlap: 4           # 交叉链重叠上限
 chain_burst_density_threshold: 0.5   # 消息爆发密度阈值 (条/小时)
 min_cluster_size: 3                  # 最小聚类大小
+chain_max_nodes: 100                 # 单链最大节点数 (超过时智能采样保留最有价值的节点)
 insight_max_news: 50                 # 单次 LLM 分析最大新闻数
 
 # ── chain significance weights: 链重要性评分权重 ──
@@ -44,11 +46,12 @@ chain_node_count_normalizer: 10.0    # 节点数归一化除数
 
 # ── eval: 自评估器 ──
 quality_threshold: 0.65              # 质量通过阈值 (0~1)
-eval_weight_evidence: 0.25           # 证据覆盖率权重
-eval_weight_reasoning: 0.20          # 推理质量权重
-eval_weight_specificity: 0.20        # 具体性权重
-eval_weight_signal: 0.20             # 信号新颖性权重
-eval_weight_consistency: 0.15        # 自洽性权重
+eval_weight_evidence: 0.15           # 证据覆盖率权重
+eval_weight_reasoning: 0.15          # 推理质量权重
+eval_weight_specificity: 0.25        # 具体性权重 (强调股票代码)
+eval_weight_signal: 0.15             # 信号新颖性权重
+eval_weight_consistency: 0.10        # 自洽性权重
+eval_weight_investment_relevance: 0.20  # 投资相关性权重 (新增)
 eval_hallucination_penalty_per_flag: 0.1   # 单个幻觉标记扣分
 eval_hallucination_max_penalty: 0.3        # 幻觉最大扣分
 eval_coverage_multiplier: 2.0              # 覆盖率乘数
@@ -56,12 +59,12 @@ eval_max_hallucination_flags: 5            # 最大幻觉标记数
 eval_pass_rate_threshold: 0.5              # 批量评估通过率阈值
 
 # ── query: 查询限制 ──
-query_limit_time_range: 200          # 时间范围查询返回上限
-query_limit_entity: 100              # 实体查询返回上限
-query_limit_urgent: 50               # 紧急新闻查询返回上限
-query_limit_timeline: 200            # 时间线查询返回上限
-query_limit_cross: 300               # 交叉链查询返回上限
-query_plan_limit: 500                # Plan 阶段扫描上限
+query_limit_time_range: 50000        # 时间范围查询返回上限（快讯源全量获取）
+query_limit_entity: 500              # 实体查询返回上限
+query_limit_urgent: 500              # 紧急新闻查询返回上限
+query_limit_timeline: 500            # 时间线查询返回上限
+query_limit_cross: 5000              # 交叉链查询返回上限
+query_plan_limit: 50000              # Plan 阶段扫描上限
 
 # ── search: 检索模式 ──
 search_mode: hybrid                  # hybrid(向量+关键词) / keyword / entity / time
@@ -70,6 +73,64 @@ hybrid_alpha: 0.7                    # 向量权重 (0=纯关键词, 1=纯向量
 # ── agent: 闭环 Agent ──
 max_iterations: 3                    # 最大 Refine 迭代次数
 expansion_factor: 1.5                # expand_context 策略的时间窗口扩展系数
+hot_keyword_threshold: 80            # 高频词最低出现次数 (出现次数≥此值才视为高频词)
+
+# ── chain count limits: 各模式下各类链的最大数量 ──
+# 控制每次运行最多构建多少条各类型线索链，防止链过多导致 LLM 调用爆炸
+max_timeline_chains: 20              # timeline 链上限
+                                    #   auto 模式: 高频词自动实体 + tracking_keywords 实体合计
+                                    #   entity 模式: 指定实体 + 扩展关联实体 (受 max_entity_expand_chains 约束)
+max_sector_chains: 8                 # sector_propagation 链上限
+                                    #   auto 模式: 行业推断 + tracking_keywords 匹配合计
+                                    #   entity 模式: 实体扩展板块链 + 行业推断合计
+max_anomaly_chains: 1                # anomaly 链上限 (1条即覆盖所有爆发实体检测)
+max_entity_cross_chains: 1           # entity_cross 链上限 (1条即包含所有实体交叉关系)
+max_entity_expand_chains: 5          # --entity 模式: 扩展关联实体最大数量
+                                    #   从指定实体新闻中提取的共现实体，每个建一条 timeline 链
+max_sector_expand_chains: 3          # --entity 模式: 扩展关联板块链最大数量
+                                    #   从指定实体新闻中提取的关联板块，映射行业别名后建 sector 链
+max_auto_sector_chains: 3            # 非 auto 模式: 行业推断板块链最大数量
+                                    #   --entity 模式下通过行业识别补建的 sector 链上限
+
+# ── tracking keywords: 常驻跟踪关键词 (auto 模式始终建链) ──
+# 这些关键词一旦在新闻数据中出现，系统会自动:
+#   1. 为该关键词建立 timeline 链 (追踪事件演变)
+#   2. 如匹配到 industry_alias 中的行业，额外建 sector_propagation 链
+#   3. anomaly 链的密度检测会自动覆盖这些关键词
+# 可随时增删，修改后下次运行即生效
+tracking_keywords:
+  - AI                    # 人工智能
+  - 机器人                # 机器人 / 人形机器人
+  - 特斯拉                # 特斯拉 (美股映射)
+  - 商业航天              # 商业航天 / 卫星
+  - 航天                  # 航天 / 火箭
+  - 半导体                # 半导体 / 芯片
+  - 存储                  # 存储芯片 / 内存
+  - 电池                  # 电池 / 锂电池 / 固态电池
+  - 矿                    # 矿产 / 锂矿 / 稀土
+  - 算力                  # 算力 / GPU / 数据中心
+  - 服务器                # 服务器 / AI服务器
+  - 黄金                  # 黄金 / 贵金属
+  - 白银                  # 白银 / 沪银
+  - 原油                  # 原油 / 石油
+  - 国产替代
+  - 光刻机
+  - 火箭
+  - 可回收
+  - spacex
+  - optimus
+  - 美联储
+  - Anthropic
+  - 电力
+  - 英伟达
+  - 谷歌
+  - OpenAI
+  - GPT
+  - 苹果
+  - PCB
+  - AMD
+  - CPU
+  
 
 # ── harness: 调度器 ──
 circuit_breaker_threshold: 3         # 熔断阈值 (连续失败次数)
@@ -79,3 +140,94 @@ log_dir: ""                          # 留空自动使用 data_dir/logs/analyst
 log_level: INFO                      # DEBUG / INFO / WARNING / ERROR
 log_retention_days: "7 days"         # 全量日志保留
 log_error_retention_days: "14 days"  # 错误日志保留
+
+# ── filter keywords: 可配置关键词列表 ──
+political_keywords:
+  - 回信
+  - 慰问
+  - 贺信
+  - 致辞
+  - 讲话
+  - 会见
+  - 署名文章
+  - 访问
+  - 抵达
+  - 出席
+  - 发表演讲
+  - 联合声明
+  - 友好访问
+  - 签署谅解备忘录
+  - 元首峰会
+  - 共青团
+  - 妇联
+  - 工会
+  - 人大代表
+  - 政协委员
+  - 精神文明
+  - 文明创建
+  - 荣誉称号
+  - 表彰大会
+  - 劳动模范
+  - 先进工作者
+  - 道德模范
+  - 作出重要指示
+  - 作出批示
+  - 重要批示
+  - 抓好
+  - 排查整治
+  - 确保人民
+  - 加强基础研究
+  - 加强公共安全
+  - 爆炸事故
+  - 烟花厂
+  - 生命财产安全
+  - 安全生产
+
+no_value_keywords:
+  - 回信
+  - 慰问
+  - 贺信
+  - 致辞
+  - 讲话
+  - 会见
+  - 署名文章
+  - 共青团
+  - 妇联
+  - 工会
+  - 精神文明
+  - 荣誉称号
+  - 表彰大会
+  - 劳动模范
+  - 先进工作者
+  - 道德模范
+
+# ── industry alias: 行业别名映射 (用于业务匹配检测) ──
+industry_alias:
+  航运: [航运, 港口, 水上运输, 远洋, 海运, 船]
+  航空: [航空, 机场, 民航]
+  银行: [银行]
+  保险: [保险]
+  证券: [证券, 券商, 期货]
+  医药: [医药, 生物, 制药, 医疗, 中药, 化学制药, 医疗器械]
+  半导体: [半导体, 芯片, 集成电路, 封测]
+  新能源: [新能源, 光伏, 锂电, 风电, 储能, 充电桩]
+  汽车: [汽车, 整车, 零部件, 新能源车]
+  白酒: [白酒, 酒]
+  房地产: [房地产, 地产, 园区开发]
+  煤炭: [煤炭, 煤]
+  钢铁: [钢铁, 钢]
+  有色金属: [有色金属, 铜, 铝, 锂, 稀土]
+  石油: [石油, 石化, 油气]
+  电力: [电力, 电网, 发电]
+  军工: [军工, 国防, 航天, 航空装备]
+  消费电子: [消费电子, 电子, 面板, 显示]
+  家电: [家电, 白色家电, 小家电]
+  食品: [食品, 饮料, 乳制品, 调味品]
+  纺织: [纺织, 服装, 服饰]
+  化工: [化工, 化学, 化纤, 塑料]
+  建材: [建材, 水泥, 玻璃]
+  机械: [机械, 工程机械, 专用设备, 通用设备]
+  通信: [通信, 5G, 光通信]
+  传媒: [传媒, 游戏, 影视, 广告]
+  计算机: [计算机, 软件, IT, 信创, 人工智能, AI]
+  期货: [期货, 白银, 沪银, 集运, 欧线]

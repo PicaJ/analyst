@@ -15,7 +15,7 @@
 import os
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 def _default_data_dir() -> Path:
@@ -38,8 +38,9 @@ class AnalystConfig:
     llm_api_key: str = ""
     llm_max_tokens: int = 4096
     llm_temperature: float = 0.3
-    llm_timeout: float = 120.0
+    llm_timeout: float = 180.0
     llm_connect_timeout: float = 30.0
+    llm_max_retries: int = 2
 
     # ── chain ──
     chain_max_depth: int = 5
@@ -55,7 +56,16 @@ class AnalystConfig:
     chain_cross_max_overlap: int = 4
     chain_burst_density_threshold: float = 0.5
     min_cluster_size: int = 3
-    insight_max_news: int = 50
+    chain_max_nodes: int = 100           # 单链最大节点数 (超过时智能采样保留最有价值的节点)
+
+    # ── LLM 分析时的新闻展示策略 ──
+    # insight_max_news: 传给 LLM 的最大新闻条数
+    #   链节点数量不受此限制 (由 query_limit_* 控制)
+    #   超出部分会用摘要替代，确保不丢失有价值消息
+    insight_max_news: int = 80
+    # insight_summary_threshold: 当链节点数超过此值时,
+    #   前 insight_max_news 条正常展示, 剩余部分按时间窗口分组摘要
+    insight_summary_threshold: int = 80
 
     # ── chain significance weights ──
     chain_weight_source_priority: float = 0.3
@@ -67,11 +77,12 @@ class AnalystConfig:
 
     # ── eval ──
     quality_threshold: float = 0.65
-    eval_weight_evidence: float = 0.25
-    eval_weight_reasoning: float = 0.20
-    eval_weight_specificity: float = 0.20
-    eval_weight_signal: float = 0.20
-    eval_weight_consistency: float = 0.15
+    eval_weight_evidence: float = 0.15
+    eval_weight_reasoning: float = 0.15
+    eval_weight_specificity: float = 0.25
+    eval_weight_signal: float = 0.15
+    eval_weight_consistency: float = 0.10
+    eval_weight_investment_relevance: float = 0.20
     eval_hallucination_penalty_per_flag: float = 0.1
     eval_hallucination_max_penalty: float = 0.3
     eval_coverage_multiplier: float = 2.0
@@ -83,19 +94,93 @@ class AnalystConfig:
     hybrid_alpha: float = 0.7         # 向量权重 (0=纯关键词, 1=纯向量)
 
     # ── query limits ──
-    query_limit_time_range: int = 200
-    query_limit_entity: int = 100
-    query_limit_urgent: int = 50
-    query_limit_timeline: int = 200
-    query_limit_cross: int = 300
-    query_plan_limit: int = 500
+    query_limit_time_range: int = 50000
+    query_limit_entity: int = 500
+    query_limit_urgent: int = 500
+    query_limit_timeline: int = 500
+    query_limit_cross: int = 5000
+    query_plan_limit: int = 50000
 
     # ── agent ──
     max_iterations: int = 3
     expansion_factor: float = 1.5
+    hot_keyword_threshold: int = 80      # 高频词最低出现次数 (出现次数≥此值才视为高频词)
+
+    # ── chain count limits (各模式下各类链的最大数量) ──
+    # auto 模式 timeline 链上限 (高频词自动实体 + tracking_keywords 实体合计)
+    max_timeline_chains: int = 20
+    # sector_propagation 链上限 (行业推断 + 实体扩展 + tracking_keywords 合计)
+    max_sector_chains: int = 8
+    # anomaly 链上限 (通常 1 条即可，包含所有爆发实体的检测)
+    max_anomaly_chains: int = 1
+    # entity_cross 链上限
+    max_entity_cross_chains: int = 1
+    # --entity 模式下扩展关联实体的最大数量
+    max_entity_expand_chains: int = 5
+    # --entity 模式下扩展关联板块链的最大数量
+    max_sector_expand_chains: int = 3
+    # --entity 模式下扩展板块链最大数量 (非 auto 模式的行业推断)
+    max_auto_sector_chains: int = 3
+
+    # ── tracking keywords: 常驻跟踪关键词 (auto 模式始终建链) ──
+    # 这些关键词一旦在新闻中出现，系统会自动为其建立:
+    #   - timeline 链 (追踪该关键词的事件演变)
+    #   - sector_propagation 链 (如匹配到 industry_alias 则建板块链)
+    #   - anomaly 链中的密度检测会自动覆盖
+    # 可在 analyst.yaml 中随时增删
+    tracking_keywords: List[str] = field(default_factory=lambda: [
+        "AI", "机器人", "特斯拉", "商业航天", "航天",
+        "半导体", "存储", "电池", "矿", "算力",
+        "服务器", "黄金", "白银", "原油",
+    ])
 
     # ── harness ──
     circuit_breaker_threshold: int = 3
+
+    # ── filter keywords (可配置的关键词列表) ──
+    political_keywords: List[str] = field(default_factory=lambda: [
+        "回信", "慰问", "贺信", "致辞", "讲话", "会见", "署名文章", "访问", "抵达", "出席",
+        "发表演讲", "联合声明", "友好访问", "签署谅解备忘录", "元首峰会",
+        "共青团", "妇联", "工会", "人大代表", "政协委员", "精神文明", "文明创建",
+        "荣誉称号", "表彰大会", "劳动模范", "先进工作者", "道德模范",
+        "作出重要指示", "作出批示", "重要批示", "抓好", "排查整治", "确保人民",
+        "加强基础研究", "加强公共安全", "爆炸事故", "烟花厂", "生命财产安全", "安全生产",
+    ])
+    no_value_keywords: List[str] = field(default_factory=lambda: [
+        "回信", "慰问", "贺信", "致辞", "讲话", "会见", "署名文章",
+        "共青团", "妇联", "工会", "精神文明", "荣誉称号", "表彰大会",
+        "劳动模范", "先进工作者", "道德模范",
+    ])
+    industry_alias: Dict[str, List[str]] = field(default_factory=lambda: {
+        "航运": ["航运", "港口", "水上运输", "远洋", "海运", "船"],
+        "航空": ["航空", "机场", "民航"],
+        "银行": ["银行"],
+        "保险": ["保险"],
+        "证券": ["证券", "券商", "期货"],
+        "医药": ["医药", "生物", "制药", "医疗", "中药", "化学制药", "医疗器械"],
+        "半导体": ["半导体", "芯片", "集成电路", "封测"],
+        "新能源": ["新能源", "光伏", "锂电", "风电", "储能", "充电桩"],
+        "汽车": ["汽车", "整车", "零部件", "新能源车"],
+        "白酒": ["白酒", "酒"],
+        "房地产": ["房地产", "地产", "园区开发"],
+        "煤炭": ["煤炭", "煤"],
+        "钢铁": ["钢铁", "钢"],
+        "有色金属": ["有色金属", "铜", "铝", "锂", "稀土"],
+        "石油": ["石油", "石化", "油气"],
+        "电力": ["电力", "电网", "发电"],
+        "军工": ["军工", "国防", "航天", "航空装备"],
+        "消费电子": ["消费电子", "电子", "面板", "显示"],
+        "家电": ["家电", "白色家电", "小家电"],
+        "食品": ["食品", "饮料", "乳制品", "调味品"],
+        "纺织": ["纺织", "服装", "服饰"],
+        "化工": ["化工", "化学", "化纤", "塑料"],
+        "建材": ["建材", "水泥", "玻璃"],
+        "机械": ["机械", "工程机械", "专用设备", "通用设备"],
+        "通信": ["通信", "5G", "光通信"],
+        "传媒": ["传媒", "游戏", "影视", "广告"],
+        "计算机": ["计算机", "软件", "IT", "信创", "人工智能", "AI"],
+        "期货": ["期货", "白银", "沪银", "集运", "欧线"],
+    })
 
     # ── log ──
     log_dir: str = ""
@@ -137,7 +222,8 @@ class AnalystConfig:
             errors.append(f"circuit_breaker_threshold 应 >= 1, 当前: {self.circuit_breaker_threshold}")
         weights_sum = (self.eval_weight_evidence + self.eval_weight_reasoning
                        + self.eval_weight_specificity + self.eval_weight_signal
-                       + self.eval_weight_consistency)
+                       + self.eval_weight_consistency
+                       + self.eval_weight_investment_relevance)
         if abs(weights_sum - 1.0) > 0.01:
             errors.append(f"评估权重之和应为 1.0, 当前: {weights_sum:.2f}")
         return errors

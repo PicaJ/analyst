@@ -76,6 +76,7 @@ class ClueChain:
     links: List[ChainLink] = field(default_factory=list)
     significance: float = 0.0
     hidden_signals: List[str] = field(default_factory=list)
+    sampled_from: int = 0  # 采样前的原始节点数 (0 = 未采样)
 
     @property
     def time_span(self) -> str:
@@ -95,6 +96,7 @@ class ClueChain:
             "theme": self.theme,
             "significance": self.significance,
             "time_span": self.time_span,
+            "sampled_from": self.sampled_from,
             "node_count": self.node_count,
             "hidden_signals": self.hidden_signals,
             "nodes": [
@@ -145,7 +147,20 @@ _STOP_WORDS = frozenset(
     "公司 集团 股份 有限公司 控股 股东 减持 增持 公告 表示 目前 可能 导致 变更 "
     "预计 计划 相关 继续 发布 实施情况 说明 关注 进行 通过 影响 年度 记者报道 "
     "此前 未来 期间 持股 数量 合计 不超 人民币 万元 亿元 美元 报告 通知 决议 "
-    "显示 根据 收到 事项 是否 需要 提供".split()
+    "显示 根据 收到 事项 是否 需要 提供 "
+    # 公告/快讯标题高频泛词
+    "关于 工作 情况 进展 投资者 说明会 股东会 回购 集体 业绩 证券 科技 "
+    "委员会 董事会 监事会 审议 批准 表决 独立 立案 调查 处罚 处分 "
+    "之日起 交易日 收盘 价格 行使 权利 期权 激励 对象 限制性 股票 "
+    "首次 公开 发行 上市 辅导 管理 制度 规则 办法 指引 指南 "
+    "召开 会议 表决 投票 结果 有效 出席 委托 "
+    # 快讯通用词（非实体）
+    "日内 后者 前者 已停 短线 盘中 报道 消息人士 据报道 "
+    "续创 创新高 快速 拉升 涨幅扩大 跌幅扩大 直线 拉升 "
+    # 新闻标题高频泛词（非投资关键词）
+    "联社 日电 中国 美国 市场 预期 增长 全球 经济 国内 "
+    "其中 当日 当周 同比 环比 年率 季调 终值 初值 修正 "
+    "最新 今日 本周 近期 上周 上月 下月 下周".split()
 )
 
 
@@ -214,6 +229,13 @@ class ChainBuilder:
         # 3. 合并去重
         items = _merge_dedup(hybrid_items, entity_items)
 
+        # 4. 智能采样 (节点过多时保留最有价值的)
+        original_count = len(items)
+        if original_count > self.config.chain_max_nodes:
+            items = self._sample_important_nodes(items, self.config.chain_max_nodes)
+            logger.info("Timeline chain '{}' sampled: {} → {} nodes",
+                        entity, original_count, len(items))
+
         if len(items) < 2:
             return []
 
@@ -241,6 +263,7 @@ class ChainBuilder:
             links=links,
             significance=self._calc_significance(nodes),
             hidden_signals=sentiment_shifts,
+            sampled_from=original_count if original_count > self.config.chain_max_nodes else 0,
         )
         return [chain]
 
@@ -275,6 +298,12 @@ class ChainBuilder:
 
         # 3. 合并去重
         items = _merge_dedup(hybrid_items, timeline_items)
+
+        # 4. 智能采样 (节点过多时保留最有价值的)
+        original_count = len(items)
+        if original_count > self.config.chain_max_nodes:
+            items = self._sample_important_nodes(items, self.config.chain_max_nodes)
+            logger.info("Sector chain sampled: {} → {} nodes", original_count, len(items))
 
         if len(items) < 3:
             return []
@@ -319,6 +348,7 @@ class ChainBuilder:
             links=links,
             significance=self._calc_significance(nodes),
             hidden_signals=propagation_signals,
+            sampled_from=original_count if original_count > self.config.chain_max_nodes else 0,
         )
         return [chain]
 
@@ -326,7 +356,10 @@ class ChainBuilder:
         self,
         days: int = 30,
     ) -> List[ClueChain]:
-        """构建异常链 — 情绪/频率异常，可能暗示未公开信息"""
+        """构建异常链 — 情绪/频率异常，可能暗示未公开信息
+
+        优先使用快讯源，避免公告源噪音产生大量垃圾链。
+        """
         items = await self.query.get_urgent(
             days=days,
             limit=self.config.query_limit_urgent,
@@ -334,7 +367,15 @@ class ChainBuilder:
         if not items:
             return []
 
-        nodes = [ChainNode.from_dict(it) for it in items]
+        # 只保留快讯源的节点，过滤公告源噪音
+        _FILING = {"eastmoney_notice", "cninfo"}
+        nodes = [
+            ChainNode.from_dict(it)
+            for it in items
+            if it.get("source") not in _FILING
+        ]
+        if len(nodes) < 3:
+            return []
         nodes.sort(key=lambda n: n.publish_time or "")
 
         entity_bursts = self._detect_entity_bursts(nodes)
@@ -342,6 +383,9 @@ class ChainBuilder:
         chains = []
         for entity, burst_nodes in entity_bursts.items():
             if len(burst_nodes) < self.config.min_cluster_size:
+                continue
+            # 过滤掉停用词实体
+            if entity in _STOP_WORDS or len(entity) < 2:
                 continue
 
             links = []
@@ -368,7 +412,8 @@ class ChainBuilder:
             )
             chains.append(chain)
 
-        return chains
+        chains.sort(key=lambda c: c.node_count, reverse=True)
+        return chains[:5]
 
     async def build_entity_cross_chains(
         self,
@@ -377,6 +422,7 @@ class ChainBuilder:
         """构建实体交叉链 — 不同实体/主题通过共同关联被串联
 
         优先用实体字段，为空时从标题关键词提取。
+        过滤公告源噪音，只保留快讯源节点。
         """
         cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
         items = await self.query.get_by_time_range(
@@ -388,21 +434,29 @@ class ChainBuilder:
         if len(items) < 3:
             return []
 
-        nodes = [ChainNode.from_dict(it) for it in items]
+        _FILING = {"eastmoney_notice", "cninfo"}
+        nodes = [
+            ChainNode.from_dict(it)
+            for it in items
+            if it.get("source") not in _FILING
+        ]
 
         entity_map: Dict[str, List[ChainNode]] = defaultdict(list)
         for n in nodes:
             has_entity = False
             for c in n.mentioned_companies:
-                entity_map[c].append(n)
-                has_entity = True
+                if c not in _STOP_WORDS:
+                    entity_map[c].append(n)
+                    has_entity = True
             for s in n.related_sectors:
-                entity_map[s].append(n)
-                has_entity = True
+                if s not in _STOP_WORDS:
+                    entity_map[s].append(n)
+                    has_entity = True
             # 实体字段为空时从标题提取
             if not has_entity and n.title:
                 for kw in _extract_title_keywords(n.title):
-                    entity_map[kw].append(n)
+                    if kw not in _STOP_WORDS and len(kw) >= 2:
+                        entity_map[kw].append(n)
 
         chains = []
         processed: Set[str] = set()
@@ -439,7 +493,12 @@ class ChainBuilder:
                 if not common_ids:
                     continue
 
-                chain_nodes = [n for n in enodes if n.news_id in common_ids]
+                chain_nodes = []
+                seen = set()
+                for n in enodes:
+                    if n.news_id in common_ids and n.news_id not in seen:
+                        chain_nodes.append(n)
+                        seen.add(n.news_id)
                 chain_nodes.sort(key=lambda n: n.publish_time or "")
 
                 links = []
@@ -474,6 +533,62 @@ class ChainBuilder:
         return chains[:10]
 
     # ========== 内部方法 ==========
+
+    @staticmethod
+    def _sample_important_nodes(items: List[Dict[str, Any]], max_nodes: int) -> List[Dict[str, Any]]:
+        """智能采样: 保留最有价值的节点
+
+        优先级: 有股票代码 > 来源权威度 > 时间分布多样性
+        """
+        if len(items) <= max_nodes:
+            return items
+
+        selected_ids: Set[str] = set()
+        selected: List[Dict[str, Any]] = []
+
+        # 1. 优先保留有股票代码的 (投资价值最高)
+        for it in sorted(items, key=lambda x: -x.get("source_priority", 2)):
+            if len(selected) >= max_nodes:
+                break
+            if it.get("ts_codes"):
+                iid = it.get("id", "")
+                if iid and iid not in selected_ids:
+                    selected.append(it)
+                    selected_ids.add(iid)
+
+        # 2. 补充: 按天轮询, 每天取优先级最高的未选节点
+        if len(selected) < max_nodes:
+            day_items: Dict[str, List[Dict]] = defaultdict(list)
+            for it in items:
+                iid = it.get("id", "")
+                if iid in selected_ids:
+                    continue
+                day = (it.get("publish_time") or "")[:10]
+                day_items[day].append(it)
+            for day_list in day_items.values():
+                day_list.sort(key=lambda x: -x.get("source_priority", 2))
+
+            days = sorted(day_items.keys())
+            round_idx = 0
+            while len(selected) < max_nodes:
+                added_any = False
+                for day in days:
+                    if len(selected) >= max_nodes:
+                        break
+                    dl = day_items[day]
+                    if round_idx < len(dl):
+                        it = dl[round_idx]
+                        iid = it.get("id", "")
+                        if iid not in selected_ids:
+                            selected.append(it)
+                            selected_ids.add(iid)
+                            added_any = True
+                if not added_any:
+                    break
+                round_idx += 1
+
+        selected.sort(key=lambda x: x.get("publish_time", ""))
+        return selected
 
     def _detect_sentiment_shifts(self, nodes: List[ChainNode]) -> List[str]:
         signals = []

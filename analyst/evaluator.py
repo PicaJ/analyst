@@ -2,13 +2,15 @@
 自评估器 — Agent 输出质量的多维度评分与幻觉检测
 
 评分维度 (权重可配):
-  1. evidence_coverage  — 结论引用了多少链中节点
-  2. reasoning_quality  — 推理逻辑是否连贯
-  3. specificity        — 可操作项是否具体 (股票代码/时间)
-  4. signal_novelty     — 是否发现了非显而易见的信号
-  5. self_consistency   — 结论之间是否矛盾
+  1. evidence_coverage   — 结论引用了多少链中节点
+  2. reasoning_quality   — 推理逻辑是否连贯
+  3. specificity         — 可操作项是否具体 (股票代码/时间)
+  4. signal_novelty      — 是否发现了非显而易见的信号
+  5. self_consistency    — 结论之间是否矛盾
+  6. investment_relevance — 投资相关性和市场价值
 """
 
+import re
 from typing import Any, Dict, List, Optional, Set
 
 from loguru import logger
@@ -25,6 +27,7 @@ class EvaluationResult:
         self.specificity: float = 0.0
         self.signal_novelty: float = 0.0
         self.self_consistency: float = 0.0
+        self.investment_relevance: float = 0.0
         self.hallucination_flags: List[str] = []
         self.overall_score: float = 0.0
         self.passed: bool = False
@@ -37,6 +40,7 @@ class EvaluationResult:
             "specificity": round(self.specificity, 3),
             "signal_novelty": round(self.signal_novelty, 3),
             "self_consistency": round(self.self_consistency, 3),
+            "investment_relevance": round(self.investment_relevance, 3),
             "overall_score": round(self.overall_score, 3),
             "passed": self.passed,
             "hallucination_flags": self.hallucination_flags,
@@ -47,8 +51,11 @@ class EvaluationResult:
 class Evaluator:
     """自评估器"""
 
+    _STOCK_CODE_RE = re.compile(r'\d{6}\.[A-Z]{2}')
+
     def __init__(self, config: AnalystConfig):
         self.config = config
+        self._NO_VALUE_KEYWORDS = frozenset(config.no_value_keywords)
 
     def evaluate(
         self,
@@ -62,6 +69,7 @@ class Evaluator:
         result.specificity = self._score_specificity(insight)
         result.signal_novelty = self._score_signal_novelty(insight)
         result.self_consistency = self._score_self_consistency(insight)
+        result.investment_relevance = self._score_investment_relevance(insight)
 
         result.hallucination_flags = self._detect_hallucinations(
             insight, chain_nodes
@@ -74,6 +82,7 @@ class Evaluator:
             + result.specificity * cfg.eval_weight_specificity
             + result.signal_novelty * cfg.eval_weight_signal
             + result.self_consistency * cfg.eval_weight_consistency
+            + result.investment_relevance * cfg.eval_weight_investment_relevance
         )
 
         if result.hallucination_flags:
@@ -120,7 +129,6 @@ class Evaluator:
             and pass_rate >= cfg.eval_pass_rate_threshold
         )
 
-        critiques = [ev.critique for ev in results if not ev.passed]
         hallucinations = []
         for ev in results:
             hallucinations.extend(ev.hallucination_flags)
@@ -141,6 +149,14 @@ class Evaluator:
 
             aggregate_critique = "; ".join(parts)
 
+        # 计算各维度平均分 (供报告展示)
+        dim_keys = ["evidence_coverage", "reasoning_quality", "specificity",
+                     "signal_novelty", "self_consistency", "investment_relevance"]
+        dim_avgs = {}
+        for dim in dim_keys:
+            vals = [getattr(ev, dim, 0) for ev in results]
+            dim_avgs[dim] = round(sum(vals) / len(vals), 3) if vals else 0.0
+
         return {
             "overall_score": round(avg_score, 3),
             "pass_rate": round(pass_rate, 3),
@@ -148,6 +164,7 @@ class Evaluator:
             "individual_results": [ev.to_dict() for ev in results],
             "hallucination_count": len(hallucinations),
             "critique": aggregate_critique,
+            **dim_avgs,
         }
 
     # ========== 评分方法 ==========
@@ -176,16 +193,24 @@ class Evaluator:
     def _score_specificity(self, insight: Dict) -> float:
         items = insight.get("actionable_items", [])
         if not items:
-            return 0.2
+            return 0.1  # 无可操作项，直接低分
         score = 0.0
         for item in items:
             if item.get("action", "").strip():
-                score += 0.3
+                score += 0.15
             targets = item.get("targets", [])
-            if targets and any(len(str(t)) > 2 for t in targets):
-                score += 0.4
+            has_stock_code = any(self._STOCK_CODE_RE.match(str(t)) for t in targets)
+            if has_stock_code:
+                score += 0.45
+            elif targets and any(len(str(t)) > 2 for t in targets):
+                score += 0.05
             if item.get("urgency") in ("high", "medium", "low"):
-                score += 0.3
+                score += 0.1
+            if item.get("reason", "").strip():
+                score += 0.1
+            # 验证信息加分
+            if item.get("verified"):
+                score += 0.2
         return min(score / len(items), 1.0)
 
     def _score_signal_novelty(self, insight: Dict) -> float:
@@ -214,6 +239,40 @@ class Evaluator:
 
         return min(score, 1.0)
 
+    def _score_investment_relevance(self, insight: Dict) -> float:
+        """投资相关性评分 — 无市场价值的事件得极低分"""
+        thesis = insight.get("thesis", "")
+
+        # 检测纯政治/社会事件
+        if any(kw in thesis for kw in self._NO_VALUE_KEYWORDS):
+            return 0.0
+
+        items = insight.get("actionable_items", [])
+        if not items:
+            # 无可操作项 → 0.1
+            return 0.1
+
+        # 有具体股票代码的可操作项 → 高分
+        has_codes = False
+        for item in items:
+            targets = item.get("targets", [])
+            if any(self._STOCK_CODE_RE.match(str(t)) for t in targets):
+                has_codes = True
+                break
+
+        if has_codes:
+            score = 0.7
+            # 有推荐理由再加
+            if any(item.get("reason", "").strip() for item in items):
+                score += 0.15
+            # 有验证信息再加
+            if any(item.get("verified") for item in items):
+                score += 0.15
+            return min(score, 1.0)
+
+        # 有可操作项但无股票代码 → 中低分
+        return 0.3
+
     def _detect_hallucinations(self, insight: Dict, nodes: List[Dict]) -> List[str]:
         flags = []
         if not nodes:
@@ -235,8 +294,13 @@ class Evaluator:
 
         for item in insight.get("actionable_items", []):
             for t in item.get("targets", []):
-                if "." not in t and t not in source_companies and t not in source_sectors:
-                    flags.append(f"操作目标 '{t}' 不在源数据实体中")
+                t_str = str(t)
+                if self._STOCK_CODE_RE.match(t_str):
+                    continue
+                if "." in t_str:
+                    continue
+                if t_str not in source_companies and t_str not in source_sectors:
+                    flags.append(f"操作目标 '{t_str}' 不在源数据实体中")
 
         return flags
 
@@ -245,6 +309,8 @@ class Evaluator:
             return "质量达标"
 
         parts = []
+        if result.investment_relevance < 0.2:
+            parts.append("投资相关性极低，缺乏具体股票推荐或涉及纯政治/社会事件")
         if result.evidence_coverage < 0.4:
             parts.append("证据引用不足，需更多关联到具体新闻")
         if result.reasoning_quality < 0.4:

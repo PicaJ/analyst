@@ -1,0 +1,23 @@
+{
+  "generated_at": "2026-05-07T14:02:08.657156",
+  "run_id": "c437db6888d3",
+  "state": "failed",
+  "iteration": 3,
+  "quality_score": 0.0,
+  "evaluation": {
+    "overall_score": 0.0,
+    "passed": false,
+    "individual_results": [],
+    "critique": "无洞察结果可评估"
+  },
+  "total_llm_calls": 0,
+  "total_latency_ms": 144.4392210105434,
+  "refinement_strategy": "expand_context",
+  "focus_entity": null,
+  "focus_keywords": [],
+  "time_window_days": 67,
+  "total_chains": 0,
+  "total_insights": 0,
+  "insights": [],
+  "errors": []
+}

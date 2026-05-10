@@ -14,9 +14,10 @@ Agent 核心 — ReAct 闭环推理引擎
   3. critique_revise — 把批评意见反馈给 LLM 重写
 """
 
+import re
 import time
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from loguru import logger
 
@@ -26,6 +27,8 @@ from .query import NewsQuery
 from .chain_builder import ChainBuilder, ClueChain, _count_title_keywords
 from .insight_engine import InsightEngine, LLMClient
 from .evaluator import Evaluator
+from .stock_verify import verify_insight_stocks
+from .enrich import NewsEnricher
 
 
 class AnalysisAgent:
@@ -143,63 +146,153 @@ class AnalysisAgent:
 
     # ========== Phase 1: Plan ==========
 
+    # 快讯类数据源 (市场热点) vs 公告类数据源 vs 排除的非财经源
+    _FLASH_SOURCES = frozenset([
+        "cls", "jin10", "thx", "xueqiu", "eastmoney", "sina",
+        "wallstreetcn", "cctv", "akshare_cctv", "thepaper",
+    ])
+    _FILING_SOURCES = frozenset(["eastmoney_notice", "cninfo"])
+    _EXCLUDED_SOURCES = frozenset(["gov", "miit"])
+
     async def _plan(self, ctx: RunContext) -> Dict[str, Any]:
         """扫描数据，规划分析策略
 
-        使用混合检索提升初始扫描相关性:
-          - 有 entity/keywords 时: 向量+关键词混合搜索
-          - 无明确主题时: 时间范围扫描
+        分层扫描:
+          1. 优先扫快讯源 (cls/jin10/thx 等) → 捕获市场热点（全量，不截断）
+          2. 补充扫公告源 (eastmoney_notice/cninfo) → 补充个股事件
+        实体提取:
+          - 优先用数据库字段 (mentioned_companies/ts_codes)
+          - 字段为空时从标题分词中提取
+
+        链型选择策略:
+          --auto   : timeline + sector_propagation + anomaly + entity_cross (全覆盖)
+          --entity : timeline(实体) + 实体扩展链 + sector_propagation + anomaly + entity_cross
+          --keywords: sector_propagation(关键词) + timeline(自动) + anomaly + entity_cross
         """
         plan: Dict[str, Any] = {"chains": [], "scan_summary": {}}
 
         cutoff = (datetime.utcnow() - timedelta(days=ctx.time_window_days)).isoformat()
+        now_iso = datetime.utcnow().isoformat()
 
-        # 根据是否有明确主题选择搜索策略
-        search_query = ctx.focus_entity or (
-            " ".join(ctx.focus_keywords) if ctx.focus_keywords else ""
-        )
-        if search_query and self.config.search_mode in ("hybrid", "vector"):
+        # ── 分层扫描 ──
+        # 第一层: 快讯源（市场热点，全量获取，不截断）
+        flash_items = []
+        for src in self._FLASH_SOURCES:
             try:
-                recent = await self.query.search_hybrid(
-                    query=search_query,
-                    top_k=self.config.query_plan_limit,
-                    days=ctx.time_window_days,
-                    alpha=self.config.hybrid_alpha,
+                items = await self.query.get_by_time_range(
+                    cutoff, now_iso, source=src, limit=50000,
                 )
-                plan["scan_summary"]["search_mode"] = "hybrid"
+                flash_items.extend(items)
             except Exception as e:
-                logger.warning("search_hybrid 失败, 降级为 time_range: {}", e)
-                recent = await self.query.get_by_time_range(
-                    cutoff, datetime.utcnow().isoformat(), limit=self.config.query_plan_limit
-                )
-                plan["scan_summary"]["search_mode"] = "time_range_fallback"
-        else:
-            recent = await self.query.get_by_time_range(
-                cutoff, datetime.utcnow().isoformat(), limit=self.config.query_plan_limit
-            )
-            plan["scan_summary"]["search_mode"] = "time_range"
+                logger.warning("[{}] Flash source '{}' query failed: {}", ctx.run_id, src, e)
+        logger.info("[{}] Flash sources: {} items from {} sources",
+                     ctx.run_id, len(flash_items), len(self._FLASH_SOURCES))
 
+        # 第二层: 公告源（eastmoney_notice/cninfo，取最近 5000 条）
+        filing_items = []
+        for src in self._FILING_SOURCES:
+            try:
+                items = await self.query.get_by_time_range(
+                    cutoff, now_iso, source=src, limit=5000,
+                )
+                filing_items.extend(items)
+            except Exception as e:
+                logger.warning("[{}] Filing source '{}' query failed: {}", ctx.run_id, src, e)
+
+        # 合并: 快讯在前（优先被分析），公告补充
+        recent = flash_items + filing_items
+        plan["scan_summary"]["search_mode"] = "layered"
+        plan["scan_summary"]["flash_count"] = len(flash_items)
+        plan["scan_summary"]["filing_count"] = len(filing_items)
         plan["scan_summary"]["total_recent"] = len(recent)
 
-        # 统计活跃实体
+        # ── Tier 1 规则富化: 补全空字段 (ts_codes→公司名/行业) ──
+        enricher = NewsEnricher(self.config)
+        recent = enricher.enrich_items(recent)
+
+        # ── 实体统计 ──
+        # 快讯实体: 从快讯标题分词中提取（真正的市场热点）
         entity_counts: Dict[str, int] = {}
         sector_counts: Dict[str, int] = {}
-        for item in recent:
+
+        # 快讯实体: 从快讯结构化字段提取
+        for item in flash_items:
             for c in (item.get("mentioned_companies") or []):
                 entity_counts[c] = entity_counts.get(c, 0) + 1
             for s in (item.get("related_sectors") or []):
                 sector_counts[s] = sector_counts.get(s, 0) + 1
 
+        # 公告实体: 从 ts_codes 提取（个股维度）
+        for item in filing_items:
+            companies = item.get("mentioned_companies") or []
+            sectors = item.get("related_sectors") or []
+            for c in companies:
+                entity_counts[c] = entity_counts.get(c, 0) + 1
+            for s in sectors:
+                sector_counts[s] = sector_counts.get(s, 0) + 1
+            ts_codes = item.get("ts_codes") or []
+            for tc in ts_codes:
+                entity_counts[tc] = entity_counts.get(tc, 0) + 1
+
+        # 快讯实体: 从标题分词提取（市场热点词）
+        flash_kws = _count_title_keywords(flash_items, top_n=30)
+
+        # 记录原始实体集合（用于高频词去重，避免已建链的实体重复出线）
+        pre_existing_entities = set(entity_counts.keys())
+
+        for kw, count in flash_kws:
+            if count >= 2 and kw not in entity_counts:
+                entity_counts[kw] = count
+
         plan["scan_summary"]["top_entities"] = sorted(
             entity_counts.items(), key=lambda x: -x[1]
-        )[:10]
+        )[:15]
         plan["scan_summary"]["top_sectors"] = sorted(
             sector_counts.items(), key=lambda x: -x[1]
         )[:10]
 
-        # 确定要构建的链类型
-        chains_to_build: List[Dict[str, Any]] = []
+        # ── 高频词检索: 仅从快讯源提取（避免公告泛词淹没热点）──
+        hot_keywords = []
+        no_value_kw = frozenset(self.config.no_value_keywords)
+        for kw, count in flash_kws:
+            if kw in pre_existing_entities:
+                continue
+            if any(pk in kw for pk in self._POLITICAL_KEYWORDS):
+                continue
+            if any(nk in kw for nk in no_value_kw):
+                continue
+            if count >= self.config.hot_keyword_threshold:
+                hot_keywords.append((kw, count))
+        plan["scan_summary"]["hot_keywords"] = hot_keywords[:15]
+        if hot_keywords:
+            logger.info("[{}] Hot keywords (from flash): {}",
+                        ctx.run_id, ", ".join(f"{k}({c})" for k, c in hot_keywords[:15]))
 
+        # ── 行业识别: 从高频词中匹配行业板块 ──
+        auto_sector_keywords = self._infer_sectors_from_keywords(
+            flash_kws, sector_counts,
+        )
+        if auto_sector_keywords:
+            logger.info("[{}] Auto-detected sectors: {}",
+                        ctx.run_id,
+                        ", ".join(f"{s}(kws={kws})" for s, kws in auto_sector_keywords))
+
+        # ── tracking keywords 匹配: 检查常驻跟踪关键词是否出现在新闻中 ──
+        tracking_kws = self.config.tracking_keywords
+        tracking_hits = self._match_tracking_keywords(
+            tracking_kws, flash_items + filing_items,
+        )
+        if tracking_hits:
+            logger.info("[{}] Tracking keywords hit: {}",
+                        ctx.run_id,
+                        ", ".join(f"{k}({c})" for k, c in tracking_hits[:15]))
+        plan["scan_summary"]["tracking_hits"] = tracking_hits
+
+        # ── 建链 ──
+        chains_to_build: List[Dict[str, Any]] = []
+        cfg = self.config
+
+        # === 指定实体模式: timeline + 实体扩展 ===
         if ctx.focus_entity:
             chains_to_build.append({
                 "type": "timeline",
@@ -207,7 +300,25 @@ class AnalysisAgent:
                 "entity_type": "company",
                 "days": ctx.time_window_days,
             })
+            # 实体扩展: 从指定实体的新闻中提取关联板块和实体
+            expansion = self._expand_entity(
+                ctx.focus_entity, flash_items + filing_items,
+            )
+            for rel_entity in expansion["related_entities"][:cfg.max_entity_expand_chains]:
+                chains_to_build.append({
+                    "type": "timeline",
+                    "entity": rel_entity,
+                    "entity_type": "keyword",
+                    "days": ctx.time_window_days,
+                })
+            for sector_kws in expansion["sector_keywords"][:cfg.max_sector_expand_chains]:
+                chains_to_build.append({
+                    "type": "sector_propagation",
+                    "keywords": sector_kws,
+                    "days": ctx.time_window_days,
+                })
 
+        # === 指定关键词模式: sector_propagation ===
         if ctx.focus_keywords:
             chains_to_build.append({
                 "type": "sector_propagation",
@@ -215,45 +326,232 @@ class AnalysisAgent:
                 "days": ctx.time_window_days,
             })
 
+        # === 常驻链: anomaly + entity_cross (所有模式) ===
         if len(recent) >= 5:
-            chains_to_build.append({
-                "type": "anomaly",
-                "days": ctx.time_window_days,
-            })
+            for _ in range(cfg.max_anomaly_chains):
+                chains_to_build.append({
+                    "type": "anomaly",
+                    "days": ctx.time_window_days,
+                })
         if len(recent) >= 3:
-            chains_to_build.append({
-                "type": "entity_cross",
-                "days": ctx.time_window_days,
-            })
+            for _ in range(cfg.max_entity_cross_chains):
+                chains_to_build.append({
+                    "type": "entity_cross",
+                    "days": ctx.time_window_days,
+                })
 
-        # 自动选热门实体
+        # === auto 模式: 自动选热门实体 + 自动板块链 + tracking keywords ===
         if not ctx.focus_entity and not ctx.focus_keywords:
-            # 实体字段可能为空，优先用标题关键词
             auto_entities = []
-            if entity_counts:
-                for entity, count in sorted(
-                    entity_counts.items(), key=lambda x: -x[1]
-                )[:3]:
-                    if count >= 2:
+            # tracking keywords 优先: 常驻跟踪关键词在新闻中命中的
+            for kw, _count in tracking_hits:
+                auto_entities.append(kw)
+            # 快讯标题关键词补充
+            for kw, count in flash_kws:
+                if count >= 2 and kw not in auto_entities:
+                    auto_entities.append(kw)
+                if len(auto_entities) >= cfg.max_timeline_chains:
+                    break
+            # 补充: 公告源的 ts_codes 高频实体
+            if len(auto_entities) < cfg.max_timeline_chains:
+                for entity, count in sorted(entity_counts.items(), key=lambda x: -x[1]):
+                    if entity not in auto_entities and count >= 3:
                         auto_entities.append(entity)
-            if not auto_entities:
-                # 实体字段为空，从标题提取高频关键词
-                title_kws = _count_title_keywords(recent, top_n=10)
-                for kw, count in title_kws:
-                    if count >= 2:
-                        auto_entities.append(kw)
-                    if len(auto_entities) >= 3:
+                    if len(auto_entities) >= cfg.max_timeline_chains:
                         break
             for entity in auto_entities:
                 chains_to_build.append({
                     "type": "timeline",
                     "entity": entity,
-                    "entity_type": "company",
+                    "entity_type": "keyword",
                     "days": ctx.time_window_days,
                 })
 
+            # 自动板块传导链: 行业推断 + tracking keywords 匹配行业
+            sector_added = 0
+            # tracking keywords 命中且匹配到行业的，优先建板块链
+            for kw, _count in tracking_hits:
+                if sector_added >= cfg.max_sector_chains:
+                    break
+                sector_kws = self._keyword_to_sector_keywords(kw)
+                if sector_kws:
+                    chains_to_build.append({
+                        "type": "sector_propagation",
+                        "keywords": sector_kws,
+                        "days": ctx.time_window_days,
+                    })
+                    sector_added += 1
+            # 行业推断补充
+            for _sector_name, sector_kws in auto_sector_keywords:
+                if sector_added >= cfg.max_sector_chains:
+                    break
+                chains_to_build.append({
+                    "type": "sector_propagation",
+                    "keywords": sector_kws,
+                    "days": ctx.time_window_days,
+                })
+                sector_added += 1
+
+        # === 非关键词模式下也补建板块链 (有行业热点时) ===
+        elif not ctx.focus_keywords and auto_sector_keywords:
+            for _sector_name, sector_kws in auto_sector_keywords[:cfg.max_auto_sector_chains]:
+                chains_to_build.append({
+                    "type": "sector_propagation",
+                    "keywords": sector_kws,
+                    "days": ctx.time_window_days,
+                })
+
+        # 高频词建链 — 为未被已有链覆盖的高频词构建 timeline 链
+        covered_entities = {c.get("entity") for c in chains_to_build if c.get("entity")}
+        timeline_count = sum(1 for c in chains_to_build if c.get("type") == "timeline")
+        for kw, count in hot_keywords:
+            if timeline_count >= cfg.max_timeline_chains:
+                break
+            if kw not in covered_entities:
+                chains_to_build.append({
+                    "type": "timeline",
+                    "entity": kw,
+                    "entity_type": "keyword",
+                    "days": ctx.time_window_days,
+                })
+                covered_entities.add(kw)
+                timeline_count += 1
+
         plan["chains"] = chains_to_build
+        logger.info("[{}] Plan: {} chains (timeline={}, sector={}, anomaly={}, cross={})",
+                    ctx.run_id, len(chains_to_build),
+                    sum(1 for c in chains_to_build if c.get("type") == "timeline"),
+                    sum(1 for c in chains_to_build if c.get("type") == "sector_propagation"),
+                    sum(1 for c in chains_to_build if c.get("type") == "anomaly"),
+                    sum(1 for c in chains_to_build if c.get("type") == "entity_cross"))
         return plan
+
+    # ========== Plan 辅助方法 ==========
+
+    def _match_tracking_keywords(
+        self,
+        tracking_kws: List[str],
+        items: List[Dict[str, Any]],
+    ) -> List[tuple]:
+        """检查常驻跟踪关键词是否出现在新闻标题/实体中，返回命中的关键词及出现次数"""
+        kw_counts: Dict[str, int] = {}
+        for item in items:
+            title = item.get("title", "")
+            companies = " ".join(item.get("mentioned_companies") or [])
+            sectors = " ".join(item.get("related_sectors") or [])
+            text = f"{title} {companies} {sectors}"
+            for kw in tracking_kws:
+                if kw in text:
+                    kw_counts[kw] = kw_counts.get(kw, 0) + 1
+        return sorted(kw_counts.items(), key=lambda x: -x[1])
+
+    def _keyword_to_sector_keywords(self, keyword: str) -> List[str] | None:
+        """将关键词映射到 industry_alias 中的行业别名列表
+
+        如果关键词出现在某个行业的别名中，返回该行业的别名列表。
+        """
+        industry_alias = self.config.industry_alias
+        for industry, aliases in industry_alias.items():
+            if keyword in aliases or keyword == industry:
+                return aliases[:5]
+        return None
+
+    def _infer_sectors_from_keywords(
+        self,
+        flash_kws: List[tuple],
+        sector_counts: Dict[str, int],
+    ) -> List[tuple]:
+        """从高频词和板块统计中推断热点行业，生成板块传导关键词
+
+        返回: [(行业名, [关键词列表]), ...]
+        """
+        industry_alias = self.config.industry_alias
+        all_hot_words = set(kw for kw, count in flash_kws if count >= 2)
+        # 把板块统计中的高频板块也纳入
+        for sector, count in sector_counts.items():
+            if count >= 3:
+                all_hot_words.add(sector)
+
+        matched: Dict[str, List[str]] = {}
+        for industry, aliases in industry_alias.items():
+            hits = [a for a in aliases if a in all_hot_words]
+            if hits:
+                matched[industry] = hits
+
+        result = []
+        for industry, aliases in sorted(
+            matched.items(), key=lambda x: -len(x[1])
+        ):
+            result.append((industry, aliases[:5]))
+            if len(result) >= 5:
+                break
+        return result
+
+    def _expand_entity(
+        self,
+        entity: str,
+        items: List[Dict[str, Any]],
+        max_related: int = 5,
+    ) -> Dict[str, Any]:
+        """从指定实体的新闻中提取关联板块和上下游实体
+
+        返回:
+          related_entities: 与指定实体共现的其他实体 (去重，最多 max_related 个)
+          sector_keywords: 关联板块的行业别名关键词列表
+        """
+        from collections import Counter
+
+        entity_lower = entity.lower()
+        related_companies: Counter = Counter()
+        related_sectors: Counter = Counter()
+
+        for item in items:
+            # 检查该条新闻是否涉及指定实体
+            title = item.get("title", "").lower()
+            companies = item.get("mentioned_companies") or []
+            sectors = item.get("related_sectors") or []
+            ts_codes = item.get("ts_codes") or []
+
+            entity_mentioned = (
+                entity_lower in title
+                or entity in companies
+                or entity in sectors
+                or any(entity in tc for tc in ts_codes)
+            )
+            if not entity_mentioned:
+                continue
+
+            # 收集同一条新闻中的其他实体
+            for c in companies:
+                if c != entity:
+                    related_companies[c] += 1
+            for s in sectors:
+                if s != entity:
+                    related_sectors[s] += 1
+
+        # 选取共现 >= 2 次的实体
+        top_entities = [
+            e for e, cnt in related_companies.most_common(max_related)
+            if cnt >= 2
+        ]
+
+        # 从关联板块映射到行业别名关键词
+        sector_kws_list = []
+        industry_alias = self.config.industry_alias
+        seen_industries: set = set()
+        for sector, _ in related_sectors.most_common(5):
+            for industry, aliases in industry_alias.items():
+                if industry in seen_industries:
+                    continue
+                if sector in aliases or sector == industry:
+                    sector_kws_list.append(aliases[:5])
+                    seen_industries.add(industry)
+                    break
+
+        return {
+            "related_entities": top_entities,
+            "sector_keywords": sector_kws_list[:3],
+        }
 
     # ========== Phase 2: Execute ==========
 
@@ -274,6 +572,10 @@ class AnalysisAgent:
 
         # 过滤低显著性链
         all_chains = [c for c in all_chains if c.significance >= self.config.chain_significance_filter]
+
+        # 前置过滤: 跳过无投资价值的链（节省 LLM 调用）
+        all_chains = self._filter_investment_irrelevant(all_chains)
+
         logger.info("[{}] Built {} chains (after significance filter)",
                     ctx.run_id, len(all_chains))
 
@@ -296,6 +598,27 @@ class AnalysisAgent:
             engine.set_critique(ctx.critique)
 
         insights = await engine.analyze_chains(all_chains)
+
+        # 去重: 主题相似的洞察只保留置信度最高的
+        logger.info("[{}] Deduplicating {} insights...", ctx.run_id, len(insights))
+        insights = self._deduplicate_insights(insights)
+
+        # 后置过滤: 移除低质量洞察
+        logger.info("[{}] Filtering low-quality insights...", ctx.run_id)
+        insights = self._filter_low_quality_insights(insights)
+
+        # 股票验证: 联网核实推荐股票
+        data_dir_str = str(self.config.data_dir)
+        total_items = sum(len(ins.get("actionable_items", [])) for ins in insights)
+        logger.info("[{}] Verifying {} stocks across {} insights...",
+                    ctx.run_id, total_items, len(insights))
+        for i, ins in enumerate(insights):
+            try:
+                verify_insight_stocks(ins, data_dir=data_dir_str)
+            except Exception as e:
+                logger.warning("Stock verification failed for insight {}: {}", i, e)
+        logger.info("[{}] Stock verification done.", ctx.run_id)
+
         return all_chains, insights
 
     async def _build_chain(
@@ -427,3 +750,114 @@ class AnalysisAgent:
             ctx.transition(AgentState.FAILED)
             return False
         return True
+
+    @property
+    def _POLITICAL_KEYWORDS(self) -> frozenset:
+        return frozenset(self.config.political_keywords)
+
+    @property
+    def _NO_VALUE_KEYWORDS(self) -> frozenset:
+        return frozenset(self.config.no_value_keywords)
+
+    def _filter_investment_irrelevant(self, chains: List[ClueChain]) -> List[ClueChain]:
+        """前置过滤: 跳过无投资价值的链"""
+        kept = []
+        for c in chains:
+            theme = c.theme
+            has_codes = any(n.ts_codes for n in c.nodes)
+            # 政治类关键词过滤 (有 ts_codes 例外)
+            if any(kw in theme for kw in self._POLITICAL_KEYWORDS):
+                if not has_codes:
+                    logger.debug("Skipping non-investment chain: {}", theme)
+                    continue
+            # 无投资价值关键词过滤 (有 ts_codes 例外)
+            if any(kw in theme for kw in self._NO_VALUE_KEYWORDS):
+                if not has_codes:
+                    logger.debug("Skipping no-value chain: {}", theme)
+                    continue
+            kept.append(c)
+        if len(kept) < len(chains):
+            logger.info("Filtered non-investment chains: {} → {}", len(chains), len(kept))
+        return kept
+
+    @staticmethod
+    def _filter_low_quality_insights(insights: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """后置过滤: 移除低质量洞察"""
+        kept = []
+        for ins in insights:
+            # 跳过分析失败的
+            if ins.get("error") or ins.get("confidence", 0) == 0:
+                continue
+            # 过滤掉极低置信度
+            if ins.get("confidence", 0) < 0.3:
+                continue
+            # 过滤掉无可操作项的洞察（没有具体操作建议就不算投资分析）
+            items = ins.get("actionable_items", [])
+            has_stock_targets = False
+            for item in items:
+                if item.get("targets"):
+                    has_stock_targets = True
+                    break
+            if not has_stock_targets:
+                logger.debug("Skipping insight without stock targets: {}",
+                             ins.get("thesis", "")[:60])
+                continue
+            kept.append(ins)
+        if len(kept) < len(insights):
+            logger.info("Filtered low-quality insights: {} → {}", len(insights), len(kept))
+        return kept
+
+    @staticmethod
+    def _deduplicate_insights(insights: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """双重去重: LCS最长公共子串 + 3-gram Jaccard"""
+        if len(insights) <= 1:
+            return insights
+
+        def _lcs_len(s1: str, s2: str) -> int:
+            m, n = len(s1), len(s2)
+            if m == 0 or n == 0:
+                return 0
+            prev = [0] * (n + 1)
+            best = 0
+            for i in range(1, m + 1):
+                curr = [0] * (n + 1)
+                for j in range(1, n + 1):
+                    if s1[i-1] == s2[j-1]:
+                        curr[j] = prev[j-1] + 1
+                        if curr[j] > best:
+                            best = curr[j]
+                prev = curr
+            return best
+
+        def _ngrams(text: str, n: int = 3) -> Set[str]:
+            punct = '，。、！？,:；;""''（）()[]{}'
+            clean = text.translate(str.maketrans('', '', punct + ' '))
+            return set(clean[i:i+n] for i in range(max(len(clean)-n+1, 1)) if len(clean[i:i+n]) == n)
+
+        kept: List[Dict[str, Any]] = []
+        for ins in insights:
+            thesis = ins.get("thesis", "")
+            is_dup = False
+            for i, existing in enumerate(kept):
+                ex_thesis = existing.get("thesis", "")
+                # 方法1: 最长公共子串 >= 10 (调高避免误判不同主题)
+                if _lcs_len(thesis, ex_thesis) >= 10:
+                    is_dup = True
+                else:
+                    # 方法2: 3-gram Jaccard >= 0.35 (调高避免相似但不同主题被合并)
+                    ng1 = _ngrams(thesis)
+                    ng2 = _ngrams(ex_thesis)
+                    if ng1 and ng2:
+                        jaccard = len(ng1 & ng2) / len(ng1 | ng2)
+                        if jaccard >= 0.35:
+                            is_dup = True
+                if is_dup:
+                    if ins.get("confidence", 0) > existing.get("confidence", 0):
+                        kept[i] = ins
+                    break
+            if not is_dup:
+                kept.append(ins)
+
+        if len(kept) < len(insights):
+            logger.info("Deduplicated insights: {} → {}", len(insights), len(kept))
+        return kept
