@@ -338,7 +338,7 @@ class AnalysisAgent:
                 "days": ctx.time_window_days,
             })
 
-        # === 常驻链: anomaly + entity_cross (所有模式) ===
+        # === 常驻链: anomaly + entity_cross + semantic (所有模式) ===
         if len(recent) >= 5:
             for _ in range(cfg.max_anomaly_chains):
                 chains_to_build.append({
@@ -351,6 +351,12 @@ class AnalysisAgent:
                     "type": "entity_cross",
                     "days": ctx.time_window_days,
                 })
+        # 语义主题发现: 从未覆盖新闻中发现新兴投资主题
+        if len(recent) >= 10:
+            chains_to_build.append({
+                "type": "semantic_cluster",
+                "days": ctx.time_window_days,
+            })
 
         # === auto 模式: 自动选热门实体 + 自动板块链 + tracking keywords ===
         if not ctx.focus_entity and not ctx.focus_keywords:
@@ -429,13 +435,45 @@ class AnalysisAgent:
                 covered_entities.add(kw)
                 timeline_count += 1
 
+        # === 公司级链: 从公告 ts_codes 中提取高频公司建链 ===
+        if not ctx.focus_entity and not ctx.focus_keywords:
+            company_ts_counts: Dict[str, int] = {}
+            for item in filing_items:
+                codes = item.get("ts_codes") or []
+                if isinstance(codes, str):
+                    try:
+                        import json as _json
+                        codes = _json.loads(codes)
+                    except Exception:
+                        codes = []
+                for tc in codes:
+                    company_ts_counts[tc] = company_ts_counts.get(tc, 0) + 1
+            # 高频公司: 公告数 >= 5 条 且未被现有链覆盖
+            max_company_chains = getattr(cfg, "max_company_chains", 3)
+            company_added = 0
+            for tc, cnt in sorted(company_ts_counts.items(), key=lambda x: -x[1]):
+                if cnt < 5 or company_added >= max_company_chains:
+                    break
+                if tc in covered_entities:
+                    continue
+                chains_to_build.append({
+                    "type": "timeline",
+                    "entity": tc,
+                    "entity_type": "ts_code",
+                    "days": ctx.time_window_days,
+                })
+                covered_entities.add(tc)
+                company_added += 1
+                logger.debug("[{}] Company chain: {} ({} filings)", ctx.run_id, tc, cnt)
+
         plan["chains"] = chains_to_build
-        logger.info("[{}] Plan: {} chains (timeline={}, sector={}, anomaly={}, cross={})",
+        logger.info("[{}] Plan: {} chains (timeline={}, sector={}, anomaly={}, cross={}, semantic={})",
                     ctx.run_id, len(chains_to_build),
                     sum(1 for c in chains_to_build if c.get("type") == "timeline"),
                     sum(1 for c in chains_to_build if c.get("type") == "sector_propagation"),
                     sum(1 for c in chains_to_build if c.get("type") == "anomaly"),
-                    sum(1 for c in chains_to_build if c.get("type") == "entity_cross"))
+                    sum(1 for c in chains_to_build if c.get("type") == "entity_cross"),
+                    sum(1 for c in chains_to_build if c.get("type") == "semantic_cluster"))
         return plan
 
     # ========== Plan 辅助方法 ==========
@@ -664,6 +702,10 @@ class AnalysisAgent:
             return await self.chain_builder.build_anomaly_chains(days=days)
         elif chain_type == "entity_cross":
             return await self.chain_builder.build_entity_cross_chains(days=days)
+        elif chain_type == "semantic_cluster":
+            return await self.chain_builder.build_semantic_theme_chains(
+                days=days, max_chains=getattr(self.config, "max_semantic_chains", 3),
+            )
         return []
 
     # ========== Phase 4: Refine ==========

@@ -17,7 +17,7 @@ report_dir: ""              # 留空自动使用 data_dir/reports
 
 #deepseek
 llm_provider: deepseek       # openai / deepseek / anthropic / ollama
-llm_model: deepseek-v4-pro
+llm_model: deepseek-v4-flash
 llm_base_url: "https://api.deepseek.com"
 llm_api_key: "sk-0bea147c44df4714a1f5613b11b303c4"              # 通过环境变量 LLM_API_KEY 设置
 
@@ -83,24 +83,19 @@ hybrid_alpha: 0.7                    # 向量权重 (0=纯关键词, 1=纯向量
 # ── agent: 闭环 Agent ──
 max_iterations: 3                    # 最大 Refine 迭代次数
 expansion_factor: 1.5                # expand_context 策略的时间窗口扩展系数
-hot_keyword_threshold: 80            # 高频词最低出现次数 (出现次数≥此值才视为高频词)
+hot_keyword_threshold: 20            # 高频词最低出现次数 (出现次数≥此值才视为高频词)
 
 # ── chain count limits: 各模式下各类链的最大数量 ──
-# 控制每次运行最多构建多少条各类型线索链，防止链过多导致 LLM 调用爆炸
-max_timeline_chains: 20              # timeline 链上限
-                                    #   auto 模式: 高频词自动实体 + tracking_keywords 实体合计
-                                    #   entity 模式: 指定实体 + 扩展关联实体 (受 max_entity_expand_chains 约束)
-max_sector_chains: 8                 # sector_propagation 链上限
-                                    #   auto 模式: 行业推断 + tracking_keywords 匹配合计
-                                    #   entity 模式: 实体扩展板块链 + 行业推断合计
-max_anomaly_chains: 1                # anomaly 链上限 (1条即覆盖所有爆发实体检测)
-max_entity_cross_chains: 1           # entity_cross 链上限 (1条即包含所有实体交叉关系)
-max_entity_expand_chains: 5          # --entity 模式: 扩展关联实体最大数量
-                                    #   从指定实体新闻中提取的共现实体，每个建一条 timeline 链
-max_sector_expand_chains: 3          # --entity 模式: 扩展关联板块链最大数量
-                                    #   从指定实体新闻中提取的关联板块，映射行业别名后建 sector 链
-max_auto_sector_chains: 3            # 非 auto 模式: 行业推断板块链最大数量
-                                    #   --entity 模式下通过行业识别补建的 sector 链上限
+# 有价值的链都放行，不人为限制
+max_timeline_chains: 100             # timeline 链上限 (含公司链)
+max_sector_chains: 100               # sector_propagation 链上限
+max_anomaly_chains: 5                # anomaly 链上限
+max_entity_cross_chains: 5           # entity_cross 链上限
+max_semantic_chains: 100             # semantic_cluster 链上限 (从非覆盖新闻中发现的新兴主题)
+max_company_chains: 100              # 公司级链上限 (从公告高频 ts_codes 建链)
+max_entity_expand_chains: 100        # --entity 模式: 扩展关联实体最大数量
+max_sector_expand_chains: 100        # --entity 模式: 扩展关联板块链最大数量
+max_auto_sector_chains: 100          # 非 auto 模式: 行业推断板块链最大数量
 
 # ── tracking keywords: 常驻跟踪关键词 (auto 模式始终建链) ──
 # 这些关键词一旦在新闻数据中出现，系统会自动:

@@ -1,5 +1,44 @@
 # analyst 更新日志
 
+## v0.6.0 — 2026-05-10
+
+### 架构级改进: 覆盖率提升
+
+**问题诊断**
+- 30天非公告新闻 16,922 条，仅 333 条进入链 (覆盖率 2.0%)
+- 82.8% 的新闻不包含任何 tracking_keyword，完全未被覆盖
+- 非公告新闻结构化字段全部为空 (`mentioned_companies=[]`, `related_sectors=[]`)
+- hot_keyword_threshold=80 过高，单个热词难以达到
+
+**改进1: 实体抽取富化 (chain_builder.py)**
+- 新增 `enrich_items()` 方法: 从标题中提取公司名(→ts_codes) + 推断行业板块
+- 使用编译正则匹配 ~5000 个公司名（>=3字符，避免泛词误匹配）
+- 在所有链构建方法中调用 (build_timeline/sector/anomaly/entity_cross)
+- 配合已有 `NewsEnricher` 的 Tier1 规则富化
+
+**改进2: 语义主题发现链 (chain_builder.py)**
+- 新增 `build_semantic_theme_chains()` 方法
+- 利用已有 FAISS 向量索引对非公告新闻做 K-Means 聚类
+- 自动发现 tracking_keywords 之外的新兴投资主题
+- 过滤已覆盖簇(>30% tracking_keyword命中) 和停用词主导簇
+- 新链类型: `semantic_cluster`，上限可配置 (`max_semantic_chains`)
+
+**改进3: 公司级链构建 (agent.py)**
+- 从公告 ts_codes 统计高频公司（>=5条公告），自动建公司 timeline 链
+- 例如：601006.SH(35条公告)、688625.SH(34条公告) 等
+- 上限可配置 (`max_company_chains`)
+
+**改进4: 降低高频词阈值 (analyst.yaml)**
+- `hot_keyword_threshold`: 80 → 20
+- 使更多市场热词有机会被建链
+
+**配置新增 (config.py / analyst.yaml)**
+- `max_semantic_chains: 2` — 语义主题链上限
+- `max_company_chains: 2` — 公司级链上限
+- `max_timeline_chains: 18` — timeline 链上限(含公司链)
+
+---
+
 ## v0.5.1 — 2026-05-10
 
 ### 行情播报过滤持续强化 (chain_builder.py)

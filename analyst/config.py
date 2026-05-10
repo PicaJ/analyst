@@ -117,6 +117,10 @@ class AnalystConfig:
     max_anomaly_chains: int = 1
     # entity_cross 链上限
     max_entity_cross_chains: int = 1
+    # semantic_cluster 链上限
+    max_semantic_chains: int = 3
+    # 公司级链上限
+    max_company_chains: int = 2
     # --entity 模式下扩展关联实体的最大数量
     max_entity_expand_chains: int = 5
     # --entity 模式下扩展关联板块链的最大数量

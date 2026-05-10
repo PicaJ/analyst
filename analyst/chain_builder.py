@@ -276,6 +276,92 @@ class ChainBuilder:
 
         logger.debug("Loaded stock name map: {} entries", len(self._stock_name_map))
 
+        # 构建公司名匹配正则 (用于实体抽取)
+        self._compile_company_pattern()
+
+        # 行业别名关键词 (用于板块推断)
+        self._sector_keywords: List[Tuple[str, str]] = []
+        for sector, aliases in getattr(self.config, "industry_alias", {}).items():
+            for alias in aliases:
+                if len(alias) >= 2:
+                    self._sector_keywords.append((alias, sector))
+
+    def _compile_company_pattern(self):
+        """构建公司名匹配正则 — 按名称长度降序，优先匹配长名"""
+        import re as _re
+        if not self._stock_name_map:
+            self._company_pattern = None
+            return
+        # 只取 >= 3 字符的公司名，避免两字泛词误匹配
+        names = sorted(
+            [n for n in self._stock_name_map if len(n) >= 3],
+            key=len, reverse=True,
+        )
+        if not names:
+            self._company_pattern = None
+            return
+        # 分批构建正则（避免单条正则过长）
+        batch_size = 500
+        self._company_patterns = []
+        for i in range(0, len(names), batch_size):
+            batch = names[i:i + batch_size]
+            pat = _re.compile("|".join(_re.escape(n) for n in batch))
+            self._company_patterns.append((pat, batch))
+        self._sorted_names = names
+
+    def enrich_items(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """批量富化新闻条目：从标题抽取公司名/行业板块/股票代码
+
+        解决非公告源 (thx/cls/eastmoney等) 结构化字段全部为空的问题。
+        在链构建和规划阶段之前调用，使下游可使用 mentioned_companies、
+        related_sectors、ts_codes 等字段。
+        """
+        if not self._stock_name_map:
+            return items
+
+        for item in items:
+            title = item.get("title", "")
+            if not title:
+                continue
+
+            # ── 抽取公司名 → ts_codes ──
+            companies: List[str] = []
+            ts_set: Set[str] = set()
+            if self._company_patterns:
+                for pat, batch in self._company_patterns:
+                    for m in pat.finditer(title):
+                        name = m.group()
+                        if name in self._stock_name_map:
+                            companies.append(name)
+                            ts_set.add(self._stock_name_map[name])
+
+            if companies:
+                # 合并已有的 ts_codes
+                existing_ts = item.get("ts_codes", [])
+                if isinstance(existing_ts, str):
+                    try:
+                        existing_ts = json.loads(existing_ts)
+                    except (json.JSONDecodeError, TypeError):
+                        existing_ts = []
+                item["mentioned_companies"] = companies
+                item["ts_codes"] = list(ts_set | set(existing_ts))
+
+            # ── 推断行业板块 ──
+            sectors: List[str] = []
+            for alias, sector in self._sector_keywords:
+                if alias in title and sector not in sectors:
+                    sectors.append(sector)
+            if sectors:
+                existing_sec = item.get("related_sectors", [])
+                if isinstance(existing_sec, str):
+                    try:
+                        existing_sec = json.loads(existing_sec)
+                    except (json.JSONDecodeError, TypeError):
+                        existing_sec = []
+                item["related_sectors"] = list(set(sectors + existing_sec))
+
+        return items
+
     def _enrich_ts_codes(self, nodes: List[ChainNode]) -> None:
         """对 ts_codes 为空的节点，从标题中提取公司名并映射为股票代码"""
         if not self._stock_name_map:
@@ -339,6 +425,9 @@ class ChainBuilder:
 
         # 3. 合并去重
         items = _merge_dedup(hybrid_items, entity_items)
+
+        # 3.5 富化: 从标题抽取公司名/行业 (非公告源无结构化字段)
+        items = self.enrich_items(items)
 
         # 4. 统一过滤: 排除公告源 + 合规文件 + 关键词不相关
         before_filter = len(items)
@@ -680,6 +769,9 @@ class ChainBuilder:
         # 3. 合并去重
         items = _merge_dedup(hybrid_items, timeline_items)
 
+        # 3.5 富化: 从标题抽取公司名/行业
+        items = self.enrich_items(items)
+
         # 4. 统一过滤
         items = self._filter_for_chain(items)
 
@@ -890,7 +982,8 @@ class ChainBuilder:
         if not items:
             return []
 
-        # 统一过滤: 排除公告源 + 合规文件
+        # 富化 + 过滤
+        items = self.enrich_items(items)
         items = self._filter_for_chain(items)
 
         nodes = [ChainNode.from_dict(it) for it in items]
@@ -1035,6 +1128,182 @@ class ChainBuilder:
 
         return links, signals
 
+    async def build_semantic_theme_chains(
+        self,
+        days: int = 30,
+        max_chains: int = 5,
+        min_cluster_size: int = 5,
+    ) -> List[ClueChain]:
+        """语义主题发现链 — 从未被 tracking_keywords 覆盖的新闻中发现新兴投资主题
+
+        原理:
+          1. 获取非公告源新闻的向量嵌入
+          2. 对向量做 K-Means 聚类，每簇代表一个投资主题
+          3. 剔除已被 tracking_keywords 覆盖的簇
+          4. 对每个新簇构建 timeline 链
+        """
+        import numpy as np
+
+        # 1. 获取非公告新闻 ID + 向量
+        try:
+            vs = self.query._agent.search_engine.vector_store
+        except Exception:
+            logger.warning("语义主题发现: vector_store 不可用，跳过")
+            return []
+
+        if vs.index is None or vs.index.ntotal == 0:
+            return []
+
+        # 2. 从 DB 获取非公告新闻 ID
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        import aiosqlite
+        db = await aiosqlite.connect(self.config.db_path)
+        try:
+            async with db.execute(
+                "SELECT id FROM news_items "
+                "WHERE publish_time >= ? AND source NOT IN ('eastmoney_notice','cninfo') "
+                "ORDER BY publish_time DESC",
+                (cutoff,),
+            ) as cur:
+                rows = await cur.fetchall()
+        finally:
+            await db.close()
+
+        non_filing_ids = set(r[0] for r in rows)
+        if len(non_filing_ids) < min_cluster_size * 3:
+            return []
+
+        # 3. 从 FAISS 取出这些新闻的向量
+        # id_map: faiss_index → news_id
+        id_map = vs.id_map
+        target_indices = []
+        target_ids = []
+        for faiss_idx, news_id in enumerate(id_map):
+            if news_id in non_filing_ids:
+                target_indices.append(faiss_idx)
+                target_ids.append(news_id)
+
+        if len(target_indices) < min_cluster_size * 3:
+            return []
+
+        # 提取向量 (FAISS reconstruct)
+        try:
+            all_vecs = np.array([vs.index.reconstruct(i) for i in target_indices])
+        except Exception:
+            # IndexIVFFlat 不支持 reconstruct，退回到搜索方式
+            logger.debug("FAISS 不支持 reconstruct，跳过语义聚类")
+            return []
+
+        # 4. K-Means 聚类
+        from sklearn.cluster import KMeans
+        n_clusters = min(max_chains * 2, len(target_indices) // min_cluster_size)
+        n_clusters = max(n_clusters, 3)
+
+        # 归一化向量 (内积 → 余弦)
+        norms = np.linalg.norm(all_vecs, axis=1, keepdims=True)
+        norms[norms == 0] = 1
+        all_vecs_norm = all_vecs / norms
+
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=3, max_iter=50)
+        labels = kmeans.fit_predict(all_vecs_norm)
+
+        # 5. 筛选有效簇: 大小 >= min_cluster_size 且不被 tracking_keywords 覆盖
+        tracking_kws = set(getattr(self.config, "tracking_keywords", []))
+        chains: List[ClueChain] = []
+
+        # 批量获取新闻详情
+        news_by_id = {}
+        if target_ids:
+            items = await self.query.get_by_ids(target_ids)
+            for it in items:
+                news_by_id[it.get("id", "")] = it
+
+        for cluster_id in range(n_clusters):
+            member_indices = [i for i, l in enumerate(labels) if l == cluster_id]
+            if len(member_indices) < min_cluster_size:
+                continue
+
+            # 提取簇内新闻
+            cluster_ids = [target_ids[i] for i in member_indices]
+            cluster_items = [news_by_id[nid] for nid in cluster_ids if nid in news_by_id]
+
+            if len(cluster_items) < min_cluster_size:
+                continue
+
+            # 检查是否已被 tracking_keywords 覆盖 (>30% 的标题包含任一 tracking keyword)
+            covered_count = 0
+            for it in cluster_items:
+                title = it.get("title", "")
+                if any(kw.lower() in title.lower() for kw in tracking_kws):
+                    covered_count += 1
+            coverage_ratio = covered_count / len(cluster_items)
+
+            if coverage_ratio > 0.3:
+                continue  # 已被现有链覆盖，跳过
+
+            # 检查簇是否由停用词主导 (财务指标等非投资主题)
+            from collections import Counter
+            title_words = []
+            for it in cluster_items:
+                for w in _extract_title_keywords(it.get("title", "")):
+                    title_words.append(w)
+            top_words = [w for w, _ in Counter(title_words).most_common(5)]
+            stop_count = sum(1 for w in top_words if w in _STOP_WORDS)
+            if stop_count >= 3:
+                logger.debug("语义簇 #{}: 跳过 (停用词主导: {})", cluster_id, top_words)
+                continue
+
+            # 富化
+            cluster_items = self.enrich_items(cluster_items)
+
+            # 排序 + 截断: 最多取 50 条 (按时间倒序取最新)
+            cluster_items.sort(key=lambda x: x.get("publish_time", ""), reverse=True)
+            cluster_items = cluster_items[:50]
+            cluster_items.sort(key=lambda x: x.get("publish_time", ""))
+
+            # 生成主题: 从簇内高频标题词提取
+            from collections import Counter
+            title_words = []
+            for it in cluster_items:
+                for w in _extract_title_keywords(it.get("title", "")):
+                    title_words.append(w)
+            top_words = [w for w, _ in Counter(title_words).most_common(5)]
+            theme_label = "·".join(top_words[:3]) if top_words else "未命名主题"
+            theme = f"新兴主题: {theme_label}"
+
+            # 构建链
+            nodes = [ChainNode.from_dict(it) for it in cluster_items]
+            self._enrich_ts_codes(nodes)
+
+            chain_id = f"semantic_{cluster_id}_{datetime.utcnow().strftime('%Y%m%d')}"
+            chain = ClueChain(
+                chain_id=chain_id,
+                chain_type="semantic_cluster",
+                theme=theme,
+                significance=0.7,
+                nodes=nodes,
+            )
+
+            # 计算链的链接
+            for i in range(len(nodes) - 1):
+                chain.links.append(ChainLink(
+                    from_id=nodes[i].news_id,
+                    to_id=nodes[i + 1].news_id,
+                    link_type="semantic",
+                    strength=0.5,
+                    reason="语义相似",
+                ))
+
+            chains.append(chain)
+            logger.info("语义主题链 #{}: {} items, theme={}",
+                        cluster_id, len(cluster_items), theme[:40])
+
+            if len(chains) >= max_chains:
+                break
+
+        logger.info("语义主题发现: {} clusters → {} new chains", n_clusters, len(chains))
+        return chains
+
     async def build_entity_cross_chains(
         self,
         days: int = 60,
@@ -1056,7 +1325,8 @@ class ChainBuilder:
         if len(items) < 3:
             return []
 
-        # 统一过滤: 排除公告源 + 合规文件
+        # 富化 + 过滤
+        items = self.enrich_items(items)
         items = self._filter_for_chain(items)
         if len(items) < 3:
             return []
