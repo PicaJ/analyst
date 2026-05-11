@@ -198,7 +198,45 @@ _STOP_WORDS = frozenset(
     "盈利 亏损 扭亏 减亏 增盈 派息 分红 送转 "
     "财报 一季报 年报 半年报 季报 业绩快报 业绩预告 "
     "财报季 披露期 业绩 业绩公告 业绩报告 季度报告 "
-    "Q1 Q2 Q3 Q4 ".split()
+    "Q1 Q2 Q3 Q4 "
+    # 快讯行情泛词 (不应独立建链)
+    "回应 涨停 跌停 涨停板 跌停板 "
+    "特朗普 美股 港股 日经 台交所 恒生 "
+    "成交额 两市 涨超 跌超 "
+    "期货 主力 合约 保证金 "
+    "第一季度 第二季度 第三季度 第四季度 "
+    "我国 一季度 二季度 三季度 四季度 "
+    "超过 用于 拟向 募资 "
+    "宣布 表示 回应 澄清 "
+    "纳斯达克 标普 道琼斯 "
+    # 二次过滤: 更多泛词 (从 Round 2 测试结果中发现)
+    "国家 企业 下降 上涨 风险 ETF 上海 "
+    "研究院 亿日元 公积金 烟花爆竹 洪迪厄斯 "
+    "宣布 指出 认为 预计 预期 可能 "
+    # 三次过滤: 更多泛词 (从 Round 3 测试结果)
+    "行动 俄罗斯 美联储 下跌 盘前 欧盟 "
+    "制裁 反倾销 补贴 "
+    # 四次过滤 (从 Round 4)
+    "以色列 央行 韩国 航运 船舶 运价 "
+    "霍尔木兹 海峡 军事 战争 冲突 "
+    # 五次过滤 (从 Round 5)
+    "总统 视频 日本 建设 全国 石油 "
+    "COMEX 伊朗 伊拉克 阿联酋 卡塔尔 "
+    # 六次过滤 (从 Round 6)
+    "上调 外交部 完成 官员 美军 安全 "
+    "批准 批复 获批 "
+    # 七次过滤 (从 Round 7 - 动词/形容词泛词)
+    "谈判 连续 正在 成立 开盘 谷歌 "
+    "进行 实施 启动 推进 推动 开展 "
+    "计划 预期 目标 签署 "
+    "上市 发行 上会 辅导 "
+    "招标 中标 中标结果 获批 "
+    # 八次过滤 (从 Round 8)
+    "警示 袭击 前值 出口 进口 贸易 "
+    "签订 到期 到账 到位 "
+    # 九次过滤 (从 Round 9)
+    "发生 英国 TO 交易 附近 "
+    "那里 这里 那个 这个 ".split()
 )
 
 
@@ -1194,17 +1232,19 @@ class ChainBuilder:
             logger.debug("FAISS 不支持 reconstruct，跳过语义聚类")
             return []
 
-        # 4. K-Means 聚类
+        # 4. K-Means 聚类 — 控制簇数量，避免过多低质簇
         from sklearn.cluster import KMeans
-        n_clusters = min(max_chains * 2, len(target_indices) // min_cluster_size)
-        n_clusters = max(n_clusters, 3)
+        min_cluster_size = max(min_cluster_size, 10)  # 提高最小簇大小
+        n_clusters = min(max_chains, len(target_indices) // min_cluster_size)
+        n_clusters = max(n_clusters, 2)
+        n_clusters = min(n_clusters, 15)  # 上限 15 个簇
 
         # 归一化向量 (内积 → 余弦)
         norms = np.linalg.norm(all_vecs, axis=1, keepdims=True)
         norms[norms == 0] = 1
         all_vecs_norm = all_vecs / norms
 
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=3, max_iter=50)
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=5, max_iter=100)
         labels = kmeans.fit_predict(all_vecs_norm)
 
         # 5. 筛选有效簇: 大小 >= min_cluster_size 且不被 tracking_keywords 覆盖
@@ -1249,8 +1289,43 @@ class ChainBuilder:
                     title_words.append(w)
             top_words = [w for w, _ in Counter(title_words).most_common(5)]
             stop_count = sum(1 for w in top_words if w in _STOP_WORDS)
-            if stop_count >= 3:
+            if stop_count >= 2:
                 logger.debug("语义簇 #{}: 跳过 (停用词主导: {})", cluster_id, top_words)
+                continue
+
+            # 检查簇内主题连贯性: 簇中心与成员的平均余弦相似度
+            cluster_center = kmeans.cluster_centers_[cluster_id]
+            cluster_center_norm = cluster_center / (np.linalg.norm(cluster_center) + 1e-10)
+            member_vecs = all_vecs_norm[member_indices]
+            similarities = member_vecs @ cluster_center_norm
+            avg_similarity = float(np.mean(similarities))
+            if avg_similarity < 0.20:
+                logger.debug("语义簇 #{}: 跳过 (内聚性不足: {:.3f})", cluster_id, avg_similarity)
+                continue
+
+            # 检查是否为英文主导簇 (翻译新闻，非 A 股投资相关)
+            eng_count = sum(1 for it in cluster_items
+                            if sum(1 for c in it.get("title", "") if c.isascii() and c.isalpha())
+                            > len(it.get("title", "")) * 0.3)
+            if eng_count > len(cluster_items) * 0.4:
+                logger.debug("语义簇 #{}: 跳过 (英文主导: {}/{})", cluster_id, eng_count, len(cluster_items))
+                continue
+
+            # 检查簇内新闻是否与 A 股投资相关 (至少 30% 标题包含公司名、行业关键词或股票代码)
+            investment_keywords = set()
+            for aliases in getattr(self.config, "industry_alias", {}).values():
+                for a in aliases:
+                    if len(a) >= 2:
+                        investment_keywords.add(a)
+            a_stock_count = 0
+            for it in cluster_items:
+                title = it.get("title", "")
+                if (it.get("ts_codes") or it.get("mentioned_companies") or
+                        any(kw in title for kw in investment_keywords)):
+                    a_stock_count += 1
+            if a_stock_count < len(cluster_items) * 0.3:
+                logger.debug("语义簇 #{}: 跳过 (A股相关性不足: {}/{})",
+                             cluster_id, a_stock_count, len(cluster_items))
                 continue
 
             # 富化
@@ -1261,14 +1336,17 @@ class ChainBuilder:
             cluster_items = cluster_items[:50]
             cluster_items.sort(key=lambda x: x.get("publish_time", ""))
 
-            # 生成主题: 从簇内高频标题词提取
+            # 生成主题: 从簇内高频标题词提取 (用更长、更有意义的词)
             from collections import Counter
             title_words = []
             for it in cluster_items:
                 for w in _extract_title_keywords(it.get("title", "")):
                     title_words.append(w)
-            top_words = [w for w, _ in Counter(title_words).most_common(5)]
-            theme_label = "·".join(top_words[:3]) if top_words else "未命名主题"
+            top_words = [w for w, _ in Counter(title_words).most_common(8)]
+            # 优先选 >=3 字符的词作为主题标签 (避免两字碎片)
+            long_words = [w for w in top_words if len(w) >= 3]
+            theme_words = long_words[:3] if long_words else top_words[:3]
+            theme_label = "·".join(theme_words) if theme_words else "未命名主题"
             theme = f"新兴主题: {theme_label}"
 
             # 构建链

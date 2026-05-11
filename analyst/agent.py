@@ -266,12 +266,15 @@ class AnalysisAgent:
         # ── 高频词检索: 仅从快讯源提取（避免公告泛词淹没热点）──
         hot_keywords = []
         no_value_kw = frozenset(self.config.no_value_keywords)
+        chain_sw = frozenset(self.config.chain_stop_words)
         for kw, count in flash_kws:
             if kw in pre_existing_entities:
                 continue
             if any(pk in kw for pk in self._POLITICAL_KEYWORDS):
                 continue
             if any(nk in kw for nk in no_value_kw):
+                continue
+            if kw in chain_sw:
                 continue
             if count >= self.config.hot_keyword_threshold:
                 hot_keywords.append((kw, count))
@@ -361,19 +364,38 @@ class AnalysisAgent:
         # === auto 模式: 自动选热门实体 + 自动板块链 + tracking keywords ===
         if not ctx.focus_entity and not ctx.focus_keywords:
             auto_entities = []
+            # 链构建停用词: 不应独立建链的泛词
+            chain_sw = frozenset(cfg.chain_stop_words)
             # tracking keywords 优先: 常驻跟踪关键词在新闻中命中的
             for kw, _count in tracking_hits:
                 auto_entities.append(kw)
-            # 快讯标题关键词补充
+            # 快讯标题关键词补充 (跳过停用词 + 质量门槛)
+            # 构建行业关键词集合，用于判断是否为投资相关实体
+            industry_kws = set()
+            for aliases in getattr(cfg, "industry_alias", {}).values():
+                for a in aliases:
+                    if len(a) >= 2:
+                        industry_kws.add(a)
             for kw, count in flash_kws:
-                if count >= 2 and kw not in auto_entities:
+                if count >= 2 and kw not in auto_entities and kw not in chain_sw:
+                    # 质量门槛: 跳过过短词 (< 2 字符) 和过于宽泛的词 (出现次数 > 总新闻数 50%)
+                    if len(kw) < 2:
+                        continue
+                    if count > len(flash_items) * 0.5:
+                        continue
+                    # 投资相关性门槛: 2 字符词必须匹配行业关键词才允许建链
+                    if len(kw) == 2 and kw not in industry_kws:
+                        continue
                     auto_entities.append(kw)
                 if len(auto_entities) >= cfg.max_timeline_chains:
                     break
-            # 补充: 公告源的 ts_codes 高频实体
+            # 补充: 公告源的 ts_codes 高频实体 (跳过停用词 + 质量门槛)
             if len(auto_entities) < cfg.max_timeline_chains:
                 for entity, count in sorted(entity_counts.items(), key=lambda x: -x[1]):
-                    if entity not in auto_entities and count >= 3:
+                    if entity not in auto_entities and count >= 3 and entity not in chain_sw:
+                        # 质量门槛: 2 字符词必须匹配行业关键词
+                        if len(entity) == 2 and entity not in industry_kws:
+                            continue
                         auto_entities.append(entity)
                     if len(auto_entities) >= cfg.max_timeline_chains:
                         break
@@ -638,6 +660,9 @@ class AnalysisAgent:
         logger.info("[{}] Built {} chains (after significance filter)",
                     ctx.run_id, len(all_chains))
 
+        # Pre-LLM 链合并: 消除主题重叠，提升稳定性
+        all_chains = self._merge_overlapping_chains(all_chains)
+
         # 保存链节点数据供评估用
         self._chains_data = {}
         for c in all_chains:
@@ -857,15 +882,99 @@ class AnalysisAgent:
         return kept
 
     @staticmethod
+    def _merge_overlapping_chains(chains: List[ClueChain], threshold: float = 0.25) -> List[ClueChain]:
+        """Pre-LLM 链合并: Jaccard ≥ threshold 的链合并为一条，确定性操作。
+
+        减少主题重叠链数量，降低 LLM 调用次数，提升分析稳定性。
+        """
+        if len(chains) <= 1:
+            return chains
+
+        # 构建每条链的 news_id 集合
+        chain_node_ids: List[Set[str]] = []
+        for c in chains:
+            nids = {n.news_id for n in c.nodes if n.news_id}
+            chain_node_ids.append(nids)
+
+        # Union-Find 分组
+        n = len(chains)
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for i in range(n):
+            if not chain_node_ids[i]:
+                continue
+            for j in range(i + 1, n):
+                if not chain_node_ids[j]:
+                    continue
+                inter = len(chain_node_ids[i] & chain_node_ids[j])
+                union_size = len(chain_node_ids[i] | chain_node_ids[j])
+                if union_size > 0 and inter / union_size >= threshold:
+                    union(i, j)
+
+        # 按组合并
+        groups: Dict[int, List[int]] = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(i)
+
+        merged = []
+        for members in groups.values():
+            if len(members) == 1:
+                merged.append(chains[members[0]])
+                continue
+
+            # 按 significance 降序排列，保留最高的为主链
+            members.sort(key=lambda idx: chains[idx].significance, reverse=True)
+            primary = chains[members[0]]
+            secondary_themes = []
+
+            # 合并 nodes (去重)
+            seen_nids: Set[str] = set()
+            all_nodes = []
+            for idx in members:
+                for node in chains[idx].nodes:
+                    if node.news_id not in seen_nids:
+                        seen_nids.add(node.news_id)
+                        all_nodes.append(node)
+                if idx != members[0]:
+                    t = chains[idx].theme.split("(")[0].strip()
+                    if t not in secondary_themes:
+                        secondary_themes.append(t)
+
+            primary.nodes = all_nodes
+            if secondary_themes:
+                short = primary.theme.split("(")[0].strip()
+                extra = " + ".join(secondary_themes[:3])
+                primary.theme = f"{short} + {extra} (合并链)"
+            primary.links = []
+            merged.append(primary)
+
+        if len(merged) < len(chains):
+            logger.info("Merged overlapping chains: {} → {}", len(chains), len(merged))
+        return merged
+
+    @staticmethod
     def _filter_low_quality_insights(insights: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """后置过滤: 移除低质量洞察"""
+        """后置过滤: 移除低质量洞察 (significance 锚定，减少 LLM 波动影响)"""
         kept = []
         for ins in insights:
             # 跳过分析失败的
             if ins.get("error") or ins.get("confidence", 0) == 0:
                 continue
-            # 过滤掉极低置信度
-            if ins.get("confidence", 0) < 0.3:
+            # 过滤掉低置信度 (高 significance 链放宽阈值)
+            significance = ins.get("chain_significance", 0)
+            conf_threshold = 0.2 if significance >= 0.5 else 0.3
+            if ins.get("confidence", 0) < conf_threshold:
                 continue
             # 过滤掉无可操作项的洞察（没有具体操作建议就不算投资分析）
             items = ins.get("actionable_items", [])
@@ -885,9 +994,26 @@ class AnalysisAgent:
 
     @staticmethod
     def _deduplicate_insights(insights: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """双重去重: LCS最长公共子串 + 3-gram Jaccard"""
+        """稳定化去重: chain_id分组 + 提高文字匹配阈值"""
         if len(insights) <= 1:
             return insights
+
+        # 步骤0: 按 chain_id 分组，同一条链只保留最高 confidence
+        by_chain: Dict[str, List[Dict]] = {}
+        for ins in insights:
+            cid = ins.get("chain_id", "")
+            by_chain.setdefault(cid, []).append(ins)
+        unique_chain_insights = []
+        for group in by_chain.values():
+            if len(group) == 1:
+                unique_chain_insights.append(group[0])
+            else:
+                group.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+                unique_chain_insights.append(group[0])
+        if len(unique_chain_insights) < len(insights):
+            logger.info("Chain-id dedup: {} → {}", len(insights), len(unique_chain_insights))
+
+        insights = unique_chain_insights
 
         def _lcs_len(s1: str, s2: str) -> int:
             m, n = len(s1), len(s2)
@@ -910,22 +1036,43 @@ class AnalysisAgent:
             clean = text.translate(str.maketrans('', '', punct + ' '))
             return set(clean[i:i+n] for i in range(max(len(clean)-n+1, 1)) if len(clean[i:i+n]) == n)
 
+        def _themes_overlap(theme1: str, theme2: str, min_overlap: int = 1) -> bool:
+            """检查两个 chain_theme 是否有重叠关键词 (长度≥2)"""
+            import re as _re
+            words1 = set(w for w in _re.split(r'[/+、，,\s]+', theme1) if len(w) >= 2)
+            words2 = set(w for w in _re.split(r'[/+、，,\s]+', theme2) if len(w) >= 2)
+            return len(words1 & words2) >= min_overlap
+
         kept: List[Dict[str, Any]] = []
         for ins in insights:
             thesis = ins.get("thesis", "")
+            # 跳过分析失败的 (空 thesis 或有 error)
+            if not thesis or ins.get("error"):
+                continue
             is_dup = False
             for i, existing in enumerate(kept):
+                # 门控: chain_type 不同则跳过 (板块传导 vs 时间线不会重复)
+                ct1 = ins.get("chain_type", "")
+                ct2 = existing.get("chain_type", "")
+                theme1 = ins.get("chain_theme", "")
+                theme2 = existing.get("chain_theme", "")
+                # chain_type 不同，或 theme 无重叠 → 不做文字去重
+                if ct1 != ct2 and not _themes_overlap(theme1, theme2):
+                    continue
+                # theme 无重叠也跳过 (不同主题不应被 thesis 文字合并)
+                if theme1 and theme2 and not _themes_overlap(theme1, theme2):
+                    continue
                 ex_thesis = existing.get("thesis", "")
-                # 方法1: 最长公共子串 >= 10 (调高避免误判不同主题)
-                if _lcs_len(thesis, ex_thesis) >= 10:
+                # 方法1: 最长公共子串 >= 25 (只匹配真正相似的论点)
+                if _lcs_len(thesis, ex_thesis) >= 25:
                     is_dup = True
                 else:
-                    # 方法2: 3-gram Jaccard >= 0.35 (调高避免相似但不同主题被合并)
+                    # 方法2: 3-gram Jaccard >= 0.50
                     ng1 = _ngrams(thesis)
                     ng2 = _ngrams(ex_thesis)
                     if ng1 and ng2:
                         jaccard = len(ng1 & ng2) / len(ng1 | ng2)
-                        if jaccard >= 0.35:
+                        if jaccard >= 0.50:
                             is_dup = True
                 if is_dup:
                     if ins.get("confidence", 0) > existing.get("confidence", 0):

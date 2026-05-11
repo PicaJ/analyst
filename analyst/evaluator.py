@@ -286,11 +286,15 @@ class Evaluator:
             for s in (n.get("related_sectors") or []):
                 source_sectors.add(s)
 
+        # 构建合法 ID 集合: 同时接受原始 news_id 和序号 (字符串 "1", "2", ...)
         node_ids = {n.get("id") or n.get("news_id", "") for n in nodes}
+        seq_ids = {str(i) for i in range(1, len(nodes) + 1)}
+        valid_ids = node_ids | seq_ids
         for finding in insight.get("key_findings", []):
             for eid in finding.get("evidence_ids", []):
-                if eid and eid not in node_ids:
-                    flags.append(f"引用了不存在的证据ID: {eid}")
+                eid_str = str(eid).strip()
+                if eid_str and eid_str not in valid_ids:
+                    flags.append(f"引用了不存在的证据ID: {eid_str}")
 
         for item in insight.get("actionable_items", []):
             for t in item.get("targets", []):

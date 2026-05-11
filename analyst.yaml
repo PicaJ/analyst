@@ -17,7 +17,8 @@ report_dir: ""              # 留空自动使用 data_dir/reports
 
 #deepseek
 llm_provider: deepseek       # openai / deepseek / anthropic / ollama
-llm_model: deepseek-v4-flash
+# llm_model: deepseek-v4-flash
+llm_model: deepseek-v4-pro
 llm_base_url: "https://api.deepseek.com"
 llm_api_key: "sk-0bea147c44df4714a1f5613b11b303c4"              # 通过环境变量 LLM_API_KEY 设置
 
@@ -90,8 +91,8 @@ hot_keyword_threshold: 20            # 高频词最低出现次数 (出现次数
 max_timeline_chains: 100             # timeline 链上限 (含公司链)
 max_sector_chains: 100               # sector_propagation 链上限
 max_anomaly_chains: 5                # anomaly 链上限
-max_entity_cross_chains: 5           # entity_cross 链上限
-max_semantic_chains: 100             # semantic_cluster 链上限 (从非覆盖新闻中发现的新兴主题)
+max_entity_cross_chains: 1           # entity_cross 链上限
+max_semantic_chains: 15              # semantic_cluster 链上限 (从非覆盖新闻中发现的新兴主题)
 max_company_chains: 100              # 公司级链上限 (从公告高频 ts_codes 建链)
 max_entity_expand_chains: 100        # --entity 模式: 扩展关联实体最大数量
 max_sector_expand_chains: 100        # --entity 模式: 扩展关联板块链最大数量
@@ -295,6 +296,150 @@ chain_stop_words:
   - 业绩公告
   - 业绩报告
   - 季度报告
+  # 快讯行情泛词 (不应独立建链)
+  - 回应
+  - 涨停
+  - 跌停
+  - 涨停板
+  - 跌停板
+  - 特朗普
+  - 美股
+  - 港股
+  - 日经
+  - 台交所
+  - 恒生
+  - 成交额
+  - 两市
+  - 涨超
+  - 跌超
+  - 期货
+  - 主力
+  - 合约
+  - 保证金
+  - 第一季度
+  - 第二季度
+  - 第三季度
+  - 第四季度
+  - 一季度
+  - 二季度
+  - 三季度
+  - 四季度
+  - 超过
+  - 用于
+  - 拟向
+  - 募资
+  - 宣布
+  - 澄清
+  - 纳斯达克
+  - 标普
+  - 道琼斯
+  # 二次过滤: 更多泛词 (从测试结果发现)
+  - 国家
+  - 企业
+  - 下降
+  - 上涨
+  - 风险
+  - ETF
+  - 上海
+  - 研究院
+  - 亿日元
+  - 公积金
+  - 烟花爆竹
+  - 宣布
+  - 指出
+  - 认为
+  - 预计
+  - 预期
+  - 可能
+  # 三次过滤 (从 Round 3 测试结果)
+  - 行动
+  - 俄罗斯
+  - 美联储
+  - 下跌
+  - 盘前
+  - 欧盟
+  - 制裁
+  - 反倾销
+  - 补贴
+  # 四次过滤 (从 Round 4)
+  - 以色列
+  - 央行
+  - 韩国
+  - 航运
+  - 船舶
+  - 运价
+  - 霍尔木兹
+  - 海峡
+  - 军事
+  - 战争
+  - 冲突
+  # 五次过滤 (从 Round 5)
+  - 总统
+  - 视频
+  - 日本
+  - 建设
+  - 全国
+  - 石油
+  - COMEX
+  - 伊朗
+  - 伊拉克
+  - 阿联酋
+  - 卡塔尔
+  # 六次过滤 (从 Round 6)
+  - 上调
+  - 外交部
+  - 完成
+  - 官员
+  - 美军
+  - 安全
+  - 批准
+  - 批复
+  - 获批
+  # 七次过滤 (动词/形容词泛词)
+  - 谈判
+  - 连续
+  - 正在
+  - 成立
+  - 开盘
+  - 谷歌
+  - 进行
+  - 实施
+  - 启动
+  - 推进
+  - 推动
+  - 开展
+  - 计划
+  - 预期
+  - 目标
+  - 签署
+  - 上市
+  - 发行
+  - 上会
+  - 辅导
+  - 招标
+  - 中标
+  - 中标结果
+  # 八次过滤 (从 Round 8)
+  - 警示
+  - 袭击
+  - 前值
+  - 出口
+  - 进口
+  - 贸易
+  - 签订
+  - 到期
+  - 到账
+  - 到位
+  # 九次过滤 (从 Round 9)
+  - 发生
+  - 英国
+  - TO
+  - 交易
+  - 附近
+  - 那里
+  - 这里
+  - 那个
+  - 这个
 
 # ── filing filter: 公告过滤关键词 ──
 # 标题包含这些词的公告被视为常规合规文件，不参与链构建

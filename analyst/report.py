@@ -129,7 +129,7 @@ REPORT_TEMPLATE = """\
 {%- if item.get("verified") and item.get("verify_details") %}
 {%- for vd in item.get("verify_details", []) %}
 {%- if vd.get("verified") %}
-  - {{ vd.get("stock_name", vd["code"]) }} ({{ vd["code"] }}){% if vd.get("industry") %} | {{ vd["industry"] }}{% endif %}{% if vd.get("board") %} | {{ vd["board"] }}{% endif %} | 最新价: {{ vd.get("price", "N/A") }} | 今日: {{ vd.get("change_pct", "N/A") }}%{% if vd.get("recent_trend") %} | {{ vd["recent_trend"] }}{% endif %}{% if vd.get("trend_match") == true %} | 走势吻合{% elif vd.get("trend_match") == false %} | 走势不符{% endif %}{% if vd.get("business_match") == false %} | **业务不匹配**: {{ vd.get("business_match_note", "") }}{% endif %}{% if vd.get("disclosure_date") %} | 财报披露: {{ vd["disclosure_date"] }}{% endif %}
+  - {{ vd.get("stock_name", vd["code"]) }} ({{ vd["code"] }}){% if vd.get("industry") %} | {{ vd["industry"] }}{% endif %}{% if vd.get("board") %} | {{ vd["board"] }}{% endif %} | 最新价: {{ vd.get("price", "N/A") }} | 今日: {{ vd.get("change_pct", "N/A") }}%{% if vd.get("recent_trend") %} | {{ vd["recent_trend"] }}{% endif %}{% if vd.get("trend_match") == true %} | 走势吻合{% elif vd.get("trend_match") == false %} | 走势不符{% endif %}{% if vd.get("business_match") == false %} | **业务不匹配**: {{ vd.get("business_match_note", "") }}{% endif %}{% if vd.get("disclosure_date") %} | 财报披露: {{ vd["disclosure_date"] }}{% endif %}{% if vd.get("lhb") %} | 龙虎榜 {{ vd["lhb"]["lhb_date"] }}: 买方{{ vd["lhb"]["buy_inst_count"] }}席 卖方{{ vd["lhb"]["sell_inst_count"] }}席 机构净买入{{ vd["lhb"]["net_amount_str"] }}{% if vd["lhb"].get("reason") %} ({{ vd["lhb"]["reason"] }}){% endif %}{% endif %}
 {%- if vd.get("alternatives") %}
     - 主板平替: {% for alt in vd["alternatives"] %}{{ alt.name }}({{ alt.code }}) {{ alt.price }}元{% if alt.get("recent_trend") %} {{ alt.recent_trend }}{% endif %}{% if not loop.last %}；{% endif %}{% endfor %}
 {%- endif %}
@@ -210,6 +210,18 @@ REPORT_TEMPLATE = """\
 
 ---
 
+## 推荐股票排名
+
+> 按推荐频次×置信度综合排名，包含验证信息（价格、板块、龙虎榜）
+
+| 排名 | 代码 | 名称 | 推荐次数 | 最高置信度 | 紧迫度 | 最新价 | 今日涨跌 | 板块 | 行业 | 近5日走势 | 龙虎榜 |
+|------|------|------|---------|-----------|--------|--------|---------|------|------|----------|--------|
+{%- for s in stock_ranking %}
+| {{ loop.index }} | {{ s.code }} | {{ s.name }} | {{ s.count }} | {{ "%.0f" | format(s.max_confidence * 100) }}% | {{ s.urgency_display }} | {{ s.price_display }} | {{ s.change_display }} | {{ s.board_display }} | {{ s.industry_display }} | {{ s.trend_display }} | {{ s.lhb_display }} |
+{%- endfor %}
+
+---
+
 ## A 股散户持仓排名 Top 50
 
 > 数据截至: {{ holders_end_date }}（来源: 东方财富）
@@ -223,6 +235,70 @@ REPORT_TEMPLATE = """\
 ---
 *由 analyst 深度分析引擎自动生成 | run_id={{ ctx.run_id }}*
 """
+
+
+def _build_stock_ranking(insights: List[Dict]) -> List[Dict]:
+    """从所有洞察中汇总推荐股票，按频次×置信度排名"""
+    stocks: Dict[str, Dict] = {}
+    for ins in insights:
+        confidence = ins.get("confidence", 0)
+        for item in ins.get("actionable_items", []):
+            urgency = item.get("urgency", "medium")
+            targets = item.get("targets", [])
+            verify_details = item.get("verify_details", [])
+            # 构建 verify lookup
+            verify_map = {}
+            for vd in verify_details:
+                code = vd.get("code", "")
+                if code:
+                    verify_map[code] = vd
+
+            for code in targets:
+                if code not in stocks:
+                    stocks[code] = {
+                        "code": code,
+                        "count": 0,
+                        "max_confidence": 0,
+                        "high_urgency": False,
+                        "verify": verify_map.get(code),
+                    }
+                stocks[code]["count"] += 1
+                stocks[code]["max_confidence"] = max(stocks[code]["max_confidence"], confidence)
+                if urgency == "high":
+                    stocks[code]["high_urgency"] = True
+                # 取最新的 verify 数据
+                vd = verify_map.get(code)
+                if vd and vd.get("verified"):
+                    stocks[code]["verify"] = vd
+
+    # 排序: 推荐次数 desc → 最高置信度 desc → 是否高紧迫
+    ranked = sorted(
+        stocks.values(),
+        key=lambda x: (-x["count"], -x["max_confidence"], not x["high_urgency"]),
+    )
+
+    # 格式化显示
+    result = []
+    for s in ranked:
+        vd = s.get("verify") or {}
+        lhb = vd.get("lhb")
+        result.append({
+            "code": s["code"],
+            "name": vd.get("stock_name", s["code"]),
+            "count": s["count"],
+            "max_confidence": s["max_confidence"],
+            "urgency_display": "HIGH" if s["high_urgency"] else "-",
+            "price_display": f"{vd['price']:.2f}" if vd.get("price") else "-",
+            "change_display": f"{vd['change_pct']:+.2f}%" if vd.get("change_pct") is not None else "-",
+            "board_display": vd.get("board", "-"),
+            "industry_display": vd.get("industry", "-"),
+            "trend_display": vd.get("recent_trend", "-"),
+            "lhb_display": (
+                f"{lhb['lhb_date']} 买{ lhb['buy_inst_count']}席 卖{lhb['sell_inst_count']}席 净买{lhb['net_amount_str']}"
+                if lhb else "-"
+            ),
+        })
+    return result
 
 
 def generate_report(ctx: RunContext, output_dir: str, config=None) -> str:
@@ -338,6 +414,9 @@ def generate_report(ctx: RunContext, output_dir: str, config=None) -> str:
             "retail_pct_display": f"{retail_pct:.1f}%" if retail_pct is not None else "-",
         })
 
+    # ── 推荐股票排名 ──
+    stock_ranking = _build_stock_ranking(insights)
+
     template = Template(REPORT_TEMPLATE)
     content = template.render(
         generated_at=now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -364,6 +443,7 @@ def generate_report(ctx: RunContext, output_dir: str, config=None) -> str:
         chain_type_labels=chain_type_labels,
         tracking_keywords=tracking_keywords,
         tracking_hits=tracking_hits,
+        stock_ranking=stock_ranking,
     )
 
     filepath.write_text(content, encoding="utf-8")

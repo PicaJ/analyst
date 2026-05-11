@@ -75,7 +75,12 @@ def _fetch_spot_data() -> tuple[Dict[str, Dict], bool]:
         if df is not None and not df.empty:
             result = {}
             for _, row in df.iterrows():
-                code = str(row.get("代码", ""))
+                raw_code = str(row.get("代码", ""))
+                # 新浪返回 "sh688041" 格式, 统一为纯数字 "688041"
+                if len(raw_code) == 8 and raw_code[:2] in ("sh", "sz", "bj"):
+                    code = raw_code[2:]
+                else:
+                    code = raw_code
                 result[code] = {
                     "name": str(row.get("名称", "")),
                     "price": float(row.get("最新价", 0) or 0),
@@ -514,6 +519,15 @@ def verify_stock(code: str, analysis_text: str = "",
     disclosure = _get_disclosure_date(pure_code, data_dir)
     if disclosure:
         result["disclosure_date"] = disclosure
+
+    # 龙虎榜机构席位数据
+    try:
+        from .stock_lhb import get_lhb_for_stock
+        lhb = get_lhb_for_stock(pure_code, data_dir)
+        if lhb:
+            result["lhb"] = lhb
+    except Exception as e:
+        logger.debug("LHB fetch skipped for {}: {}", pure_code, e)
 
     # 科创板/创业板 → 找主板平替
     if _is_gem_or_star(pure_code) and industry_info:
