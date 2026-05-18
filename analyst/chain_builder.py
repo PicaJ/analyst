@@ -1060,7 +1060,7 @@ class ChainBuilder:
             chains.append(chain)
 
         chains.sort(key=lambda c: c.node_count, reverse=True)
-        return chains[:5]
+        return chains[:15]
 
     # ── 异常链辅助方法 ──
 
@@ -1524,7 +1524,7 @@ class ChainBuilder:
                 chains.append(chain)
 
         chains.sort(key=lambda c: c.significance, reverse=True)
-        return chains[:10]
+        return chains[:20]
 
     # ── 实体交叉链辅助方法 ──
 

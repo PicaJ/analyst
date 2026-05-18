@@ -11,11 +11,52 @@
 """
 
 import re
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
 from loguru import logger
 
 from .config import AnalystConfig
+
+
+@dataclass
+class ChainUtilizationMetrics:
+    """线索链利用效率指标"""
+    data_utilization_rate: float = 0.0
+    chain_type_coverage: float = 0.0
+    cross_chain_reuse: float = 0.0
+    signal_depth: float = 0.0
+    node_coverage_rate: float = 0.0
+    overall_efficiency: float = 0.0
+
+    total_news_scanned: int = 0
+    total_nodes_in_chains: int = 0
+    unique_nodes_in_chains: int = 0
+    chain_types_activated: int = 0
+    chain_types_total: int = 0
+    cross_chain_reuse_count: int = 0
+    insights_multi_chain: int = 0
+    total_insights: int = 0
+    nodes_cited_in_insights: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "data_utilization_rate": round(self.data_utilization_rate, 3),
+            "chain_type_coverage": round(self.chain_type_coverage, 3),
+            "cross_chain_reuse": round(self.cross_chain_reuse, 3),
+            "signal_depth": round(self.signal_depth, 3),
+            "node_coverage_rate": round(self.node_coverage_rate, 3),
+            "overall_efficiency": round(self.overall_efficiency, 3),
+            "total_news_scanned": self.total_news_scanned,
+            "total_nodes_in_chains": self.total_nodes_in_chains,
+            "unique_nodes_in_chains": self.unique_nodes_in_chains,
+            "chain_types_activated": self.chain_types_activated,
+            "chain_types_total": self.chain_types_total,
+            "cross_chain_reuse_count": self.cross_chain_reuse_count,
+            "insights_multi_chain": self.insights_multi_chain,
+            "total_insights": self.total_insights,
+            "nodes_cited_in_insights": self.nodes_cited_in_insights,
+        }
 
 
 class EvaluationResult:
@@ -100,6 +141,8 @@ class Evaluator:
         self,
         insights: List[Dict[str, Any]],
         chains_data: Dict[str, List[Dict[str, Any]]],
+        chains: Optional[List[Dict[str, Any]]] = None,
+        scan_total: int = 0,
     ) -> Dict[str, Any]:
         results = []
         all_scores = []
@@ -117,6 +160,7 @@ class Evaluator:
                 "passed": False,
                 "individual_results": [],
                 "critique": "无洞察结果可评估",
+                "chain_utilization": None,
             }
 
         avg_score = sum(all_scores) / len(all_scores)
@@ -165,6 +209,12 @@ class Evaluator:
             "hallucination_count": len(hallucinations),
             "critique": aggregate_critique,
             **dim_avgs,
+            "chain_utilization": (
+                self.compute_chain_utilization(
+                    insights, chains_data, chains, scan_total,
+                ).to_dict()
+                if chains is not None else None
+            ),
         }
 
     # ========== 评分方法 ==========
@@ -332,3 +382,138 @@ class Evaluator:
             parts.append(f"综合评分 {result.overall_score:.2f} 略低于阈值，需进一步打磨")
 
         return " | ".join(parts)
+
+    # ========== 链利用效率 ==========
+
+    def compute_chain_utilization(
+        self,
+        insights: List[Dict[str, Any]],
+        chains_data: Dict[str, List[Dict[str, Any]]],
+        chains: List[Dict[str, Any]],
+        scan_total: int = 0,
+    ) -> ChainUtilizationMetrics:
+        """计算线索链利用效率 — 纯计算，无 LLM 调用"""
+        m = ChainUtilizationMetrics()
+        m.total_news_scanned = scan_total
+
+        # 1. 数据利用率: 链中不重复节点数 / 扫描新闻总数
+        all_node_ids: Set[str] = set()
+        total_node_slots = 0
+        for nodes in chains_data.values():
+            total_node_slots += len(nodes)
+            for n in nodes:
+                nid = n.get("id") or n.get("news_id", "")
+                if nid:
+                    all_node_ids.add(nid)
+
+        m.total_nodes_in_chains = total_node_slots
+        m.unique_nodes_in_chains = len(all_node_ids)
+
+        if scan_total > 0:
+            m.data_utilization_rate = len(all_node_ids) / scan_total
+
+        # 2. 链类型覆盖: 激活的链类型数 / 总链类型数
+        KNOWN_CHAIN_TYPES = {
+            "timeline", "entity_cross", "sector_propagation",
+            "anomaly", "semantic_cluster",
+        }
+        m.chain_types_total = len(KNOWN_CHAIN_TYPES)
+
+        activated_types: Set[str] = set()
+        for chain in chains:
+            ct = chain.get("chain_type", "")
+            if ct:
+                activated_types.add(ct)
+        m.chain_types_activated = len(activated_types)
+        m.chain_type_coverage = len(activated_types) / max(len(KNOWN_CHAIN_TYPES), 1)
+
+        # 3. 跨链复用: 出现在 2+ 条链中的节点数
+        node_to_chains: Dict[str, Set[str]] = {}
+        for chain_id, nodes in chains_data.items():
+            for n in nodes:
+                nid = n.get("id") or n.get("news_id", "")
+                if nid:
+                    node_to_chains.setdefault(nid, set()).add(chain_id)
+
+        cross_reuse_count = sum(
+            1 for cids in node_to_chains.values() if len(cids) >= 2
+        )
+        m.cross_chain_reuse_count = cross_reuse_count
+        if all_node_ids:
+            m.cross_chain_reuse = cross_reuse_count / len(all_node_ids)
+
+        # 4. 信号深度: 有 2+ 种不同链类型支撑的洞察比例
+        chain_type_map: Dict[str, str] = {}
+        for chain in chains:
+            cid = chain.get("chain_id", "")
+            ct = chain.get("chain_type", "")
+            if cid:
+                chain_type_map[cid] = ct
+
+        # news_id → set(chain_type) 反向索引
+        news_to_chain_types: Dict[str, Set[str]] = {}
+        for chain_id, nodes in chains_data.items():
+            ct = chain_type_map.get(chain_id, "")
+            for n in nodes:
+                nid = n.get("id") or n.get("news_id", "")
+                if nid and ct:
+                    news_to_chain_types.setdefault(nid, set()).add(ct)
+
+        multi_chain_count = 0
+        m.total_insights = len(insights)
+
+        for insight in insights:
+            insight_types: Set[str] = set()
+            cid = insight.get("chain_id", "")
+            if cid and cid in chain_type_map:
+                insight_types.add(chain_type_map[cid])
+
+            for finding in insight.get("key_findings", []):
+                for eid in finding.get("evidence_ids", []):
+                    eid_str = str(eid).strip()
+                    if eid_str in news_to_chain_types:
+                        insight_types.update(news_to_chain_types[eid_str])
+
+            # 额外: 使用 agent 标注的 cross_chain_types 字段
+            for ct in insight.get("cross_chain_types", []):
+                if ct:
+                    insight_types.add(ct)
+
+            if len(insight_types) >= 2:
+                multi_chain_count += 1
+
+        m.insights_multi_chain = multi_chain_count
+        if insights:
+            m.signal_depth = multi_chain_count / len(insights)
+
+        # 5. 节点覆盖率: 被 insight evidence 引用的节点 / 链中总唯一节点
+        cited_node_ids: Set[str] = set()
+        for insight in insights:
+            for finding in insight.get("key_findings", []):
+                for eid in finding.get("evidence_ids", []):
+                    eid_str = str(eid).strip()
+                    if eid_str:
+                        cited_node_ids.add(eid_str)
+
+        # 序号 ID (1, 2, 3...) 映射到实际 news_id
+        for chain_id, nodes in chains_data.items():
+            for i, n in enumerate(nodes, 1):
+                if str(i) in cited_node_ids:
+                    nid = n.get("id") or n.get("news_id", "")
+                    if nid:
+                        cited_node_ids.add(nid)
+
+        m.nodes_cited_in_insights = len(cited_node_ids & all_node_ids)
+        if all_node_ids:
+            m.node_coverage_rate = len(cited_node_ids & all_node_ids) / len(all_node_ids)
+
+        # 6. 综合效率分: 加权平均
+        m.overall_efficiency = (
+            m.data_utilization_rate * 0.25
+            + m.chain_type_coverage * 0.20
+            + m.cross_chain_reuse * 0.15
+            + m.signal_depth * 0.20
+            + m.node_coverage_rate * 0.20
+        )
+
+        return m

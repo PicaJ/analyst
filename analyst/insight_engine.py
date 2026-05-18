@@ -584,10 +584,11 @@ class InsightEngine:
         return result
 
     def _verify_recommendations(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        """校验 LLM 推荐的股票信息是否与实际一致，过滤不匹配推荐
+        """校验 LLM 推荐的股票信息是否与实际一致，标注不匹配警告
 
-        过滤规则:
-          1. 实际行业与分析论点不相关 → 过滤 (如白色家电 vs AI芯片)
+        策略: 保留所有推荐 + 标记警告，不删除。
+        A 股跨界经营普遍（如通信公司做算力租赁、玩具公司转型 AI），
+        官方行业分类滞后，不应因行业不匹配就丢弃推荐。
         """
         stock_info = self._load_stock_info_map()
         if not stock_info:
@@ -603,16 +604,13 @@ class InsightEngine:
         industry_alias = getattr(self.config, 'industry_alias', {})
 
         for item in result.get("actionable_items", []):
-            valid_targets = []
-            valid_reasons = []
-            removed = []
+            warned_count = 0
 
             for tr in item.get("target_reasons", []):
                 code = tr.get("code", "")
 
                 info = stock_info.get(code)
                 if not info or not info.get("name"):
-                    valid_reasons.append(tr)
                     continue
 
                 actual_name = info["name"]
@@ -627,7 +625,6 @@ class InsightEngine:
                 # 检查实际行业是否与分析论点相关
                 industry_relevant = False
                 if actual_industry:
-                    # 收集该行业的所有关联关键词 (行业名 + alias)
                     keywords = set()
                     keywords.add(actual_industry)
                     for ind, aliases in industry_alias.items():
@@ -642,31 +639,19 @@ class InsightEngine:
                             break
 
                 if not industry_relevant and actual_industry:
-                    # 实际行业在分析论点中未被提及，标记为不匹配
-                    tr["business_mismatch"] = True
-                    tr["business_mismatch_note"] = (
-                        f"LLM声称「{claimed_business}」，"
-                        f"实际为「{actual_name}」（{actual_industry}），与投资论点不匹配"
+                    # 标记警告但不删除 — 跨行业经营在 A 股很常见
+                    tr["business_match"] = False
+                    tr["business_match_note"] = (
+                        f"官方行业「{actual_industry}」"
+                        f"未直接匹配分析论点，公司可能跨界经营"
                     )
-                    removed.append(tr)
-                    continue
+                    warned_count += 1
 
-                valid_reasons.append(tr)
-                valid_targets.append(code)
-
-            if removed:
-                logger.warning(
-                    "Filtered {} mismatched stock recommendations: {}",
-                    len(removed),
-                    [f"{r['code']}({r.get('actual_name', '?')})" for r in removed],
+            if warned_count:
+                logger.info(
+                    "Tagged {} cross-industry stock recommendations (not removed)",
+                    warned_count,
                 )
-
-            # 更新为仅保留有效推荐
-            item["target_reasons"] = valid_reasons
-            if valid_targets:
-                item["targets"] = valid_targets
-            elif removed and not valid_reasons:
-                item["targets"] = []
 
         return result
 

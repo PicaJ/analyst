@@ -105,7 +105,9 @@ class AnalysisAgent:
                 return ctx
             try:
                 evaluation = self.evaluator.evaluate_batch(
-                    ctx.insights, self._chains_data
+                    ctx.insights, self._chains_data,
+                    chains=ctx.chains,
+                    scan_total=ctx.analysis_plan.get("scan_summary", {}).get("total_recent", 0),
                 )
                 ctx.evaluation = evaluation
                 logger.info("[{}] Eval: score={:.3f}, passed={}",
@@ -367,8 +369,10 @@ class AnalysisAgent:
             # 链构建停用词: 不应独立建链的泛词
             chain_sw = frozenset(cfg.chain_stop_words)
             # tracking keywords 优先: 常驻跟踪关键词在新闻中命中的
+            # 但必须跳过 chain_stop_words 中的泛词 (如"美联储"等无直接投资价值的宏观词)
             for kw, _count in tracking_hits:
-                auto_entities.append(kw)
+                if kw not in chain_sw:
+                    auto_entities.append(kw)
             # 快讯标题关键词补充 (跳过停用词 + 质量门槛)
             # 构建行业关键词集合，用于判断是否为投资相关实体
             industry_kws = set()
@@ -386,6 +390,9 @@ class AnalysisAgent:
                     # 投资相关性门槛: 2 字符词必须匹配行业关键词才允许建链
                     if len(kw) == 2 and kw not in industry_kws:
                         continue
+                    # 个股名称过滤: 公司名不应独立建链 (只应作为节点出现在行业链中)
+                    if self._is_company_name(kw):
+                        continue
                     auto_entities.append(kw)
                 if len(auto_entities) >= cfg.max_timeline_chains:
                     break
@@ -395,6 +402,9 @@ class AnalysisAgent:
                     if entity not in auto_entities and count >= 3 and entity not in chain_sw:
                         # 质量门槛: 2 字符词必须匹配行业关键词
                         if len(entity) == 2 and entity not in industry_kws:
+                            continue
+                        # 个股名称过滤
+                        if self._is_company_name(entity):
                             continue
                         auto_entities.append(entity)
                     if len(auto_entities) >= cfg.max_timeline_chains:
@@ -410,9 +420,12 @@ class AnalysisAgent:
             # 自动板块传导链: 行业推断 + tracking keywords 匹配行业
             sector_added = 0
             # tracking keywords 命中且匹配到行业的，优先建板块链
+            # 同样跳过 chain_stop_words 中的泛词
             for kw, _count in tracking_hits:
                 if sector_added >= cfg.max_sector_chains:
                     break
+                if kw in chain_sw:
+                    continue
                 sector_kws = self._keyword_to_sector_keywords(kw)
                 if sector_kws:
                     chains_to_build.append({
@@ -448,6 +461,8 @@ class AnalysisAgent:
             if timeline_count >= cfg.max_timeline_chains:
                 break
             if kw not in covered_entities:
+                if self._is_company_name(kw):
+                    continue
                 chains_to_build.append({
                     "type": "timeline",
                     "entity": kw,
@@ -457,8 +472,8 @@ class AnalysisAgent:
                 covered_entities.add(kw)
                 timeline_count += 1
 
-        # === 公司级链: 从公告 ts_codes 中提取高频公司建链 ===
-        if not ctx.focus_entity and not ctx.focus_keywords:
+        # === 公司级链: 已禁用 — 个股作为节点出现在行业链中，不独立建链 ===
+        if False and not ctx.focus_entity and not ctx.focus_keywords:
             company_ts_counts: Dict[str, int] = {}
             for item in filing_items:
                 codes = item.get("ts_codes") or []
@@ -660,8 +675,10 @@ class AnalysisAgent:
         logger.info("[{}] Built {} chains (after significance filter)",
                     ctx.run_id, len(all_chains))
 
-        # Pre-LLM 链合并: 消除主题重叠，提升稳定性
-        all_chains = self._merge_overlapping_chains(all_chains)
+        # [breadth-first] 保留所有链，不合并 — 每条链是独立线索
+        # all_chains = self._merge_overlapping_chains(all_chains)
+        logger.info("[{}] Keeping {} chains (merge disabled for breadth)",
+                    ctx.run_id, len(all_chains))
 
         # 保存链节点数据供评估用
         self._chains_data = {}
@@ -690,6 +707,9 @@ class AnalysisAgent:
         # 后置过滤: 移除低质量洞察
         logger.info("[{}] Filtering low-quality insights...", ctx.run_id)
         insights = self._filter_low_quality_insights(insights)
+
+        # 跨链交叉标注: 为每条 insight 标注其证据节点在其他链类型中的出现
+        self._annotate_cross_chain_types(insights, all_chains)
 
         # 股票验证: 联网核实推荐股票
         data_dir_str = str(self.config.data_dir)
@@ -843,6 +863,30 @@ class AnalysisAgent:
     def _POLITICAL_KEYWORDS(self) -> frozenset:
         return frozenset(self.config.political_keywords)
 
+    _COMPANY_SUFFIXES = frozenset(
+        "股份 集团 科技 控股 证券 电气 电子 通讯 通信 "
+        "医药 生物 化工 新能源 材料 机械 装备 仪器 仪表 "
+        "实业 发展 投资 资本 金融 管理咨询".split()
+    )
+
+    @staticmethod
+    def _is_company_name(name: str) -> bool:
+        """判断是否为个股/公司名称 — 公司名不应独立建链"""
+        if not name:
+            return False
+        # ts_code 格式 (如 000333.SZ)
+        import re
+        if re.match(r'\d{6}\.[A-Z]{2}', name):
+            return True
+        # 常见公司后缀
+        for suffix in AnalysisAgent._COMPANY_SUFFIXES:
+            if name.endswith(suffix) and len(name) >= 3:
+                return True
+        # ST/*ST 前缀
+        if name.startswith("ST") or name.startswith("*ST"):
+            return True
+        return False
+
     @property
     def _NO_VALUE_KEYWORDS(self) -> frozenset:
         return frozenset(self.config.no_value_keywords)
@@ -880,6 +924,66 @@ class AnalysisAgent:
         if len(kept) < len(chains):
             logger.info("Filtered non-investment chains: {} → {}", len(chains), len(kept))
         return kept
+
+    def _annotate_cross_chain_types(
+        self,
+        insights: List[Dict[str, Any]],
+        all_chains: List[ClueChain],
+    ) -> None:
+        """跨链交叉标注: 为每条 insight 的 evidence_ids 标注在其他链类型中的出现
+
+        让 evaluator 能计算信号深度 (一个 insight 被多少种链类型支撑)。
+        """
+        # 构建 news_id → set(chain_type) 反向索引
+        news_to_types: Dict[str, Set[str]] = {}
+        chain_type_of: Dict[str, str] = {}
+        for c in all_chains:
+            chain_type_of[c.chain_id] = c.chain_type
+            for n in c.nodes:
+                if n.news_id:
+                    news_to_types.setdefault(n.news_id, set()).add(c.chain_type)
+
+        # 构建 chain_id → news_id 序号映射 (evidence_ids 用序号 1,2,3...)
+        chain_id_to_seq_map: Dict[str, Dict[str, str]] = {}
+        for c in all_chains:
+            seq_map: Dict[str, str] = {}
+            for i, n in enumerate(c.nodes, 1):
+                nid = n.news_id
+                if nid:
+                    seq_map[str(i)] = nid
+            chain_id_to_seq_map[c.chain_id] = seq_map
+
+        cross_count = 0
+        for ins in insights:
+            cid = ins.get("chain_id", "")
+            own_type = chain_type_of.get(cid, "")
+
+            # 收集该 insight 涉及的所有链类型
+            all_types: Set[str] = set()
+            if own_type:
+                all_types.add(own_type)
+
+            # 获取该 insight 所属链的序号→news_id 映射
+            seq_map = chain_id_to_seq_map.get(cid, {})
+
+            # 从 evidence_ids 中查找跨链类型
+            for finding in ins.get("key_findings", []):
+                for eid in finding.get("evidence_ids", []):
+                    eid_str = str(eid).strip()
+                    # 先尝试序号映射
+                    resolved_id = seq_map.get(eid_str, eid_str)
+                    if resolved_id in news_to_types:
+                        all_types.update(news_to_types[resolved_id])
+
+            # 写入 cross_chain_types 字段
+            cross_types = all_types - {own_type} if own_type else all_types - {""}
+            ins["cross_chain_types"] = sorted(cross_types)
+            if len(all_types) >= 2:
+                cross_count += 1
+
+        if cross_count:
+            logger.info("Cross-chain annotation: {}/{} insights have multi-type support",
+                        cross_count, len(insights))
 
     @staticmethod
     def _merge_overlapping_chains(chains: List[ClueChain], threshold: float = 0.25) -> List[ClueChain]:
@@ -965,31 +1069,14 @@ class AnalysisAgent:
 
     @staticmethod
     def _filter_low_quality_insights(insights: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """后置过滤: 移除低质量洞察 (significance 锚定，减少 LLM 波动影响)"""
+        """广度优先: 仅移除分析失败 (error) 或解析失败 (confidence==0) 的洞察"""
         kept = []
         for ins in insights:
-            # 跳过分析失败的
             if ins.get("error") or ins.get("confidence", 0) == 0:
-                continue
-            # 过滤掉低置信度 (高 significance 链放宽阈值)
-            significance = ins.get("chain_significance", 0)
-            conf_threshold = 0.2 if significance >= 0.5 else 0.3
-            if ins.get("confidence", 0) < conf_threshold:
-                continue
-            # 过滤掉无可操作项的洞察（没有具体操作建议就不算投资分析）
-            items = ins.get("actionable_items", [])
-            has_stock_targets = False
-            for item in items:
-                if item.get("targets"):
-                    has_stock_targets = True
-                    break
-            if not has_stock_targets:
-                logger.debug("Skipping insight without stock targets: {}",
-                             ins.get("thesis", "")[:60])
                 continue
             kept.append(ins)
         if len(kept) < len(insights):
-            logger.info("Filtered low-quality insights: {} → {}", len(insights), len(kept))
+            logger.info("Filtered failed insights: {} → {}", len(insights), len(kept))
         return kept
 
     @staticmethod
@@ -1036,13 +1123,6 @@ class AnalysisAgent:
             clean = text.translate(str.maketrans('', '', punct + ' '))
             return set(clean[i:i+n] for i in range(max(len(clean)-n+1, 1)) if len(clean[i:i+n]) == n)
 
-        def _themes_overlap(theme1: str, theme2: str, min_overlap: int = 1) -> bool:
-            """检查两个 chain_theme 是否有重叠关键词 (长度≥2)"""
-            import re as _re
-            words1 = set(w for w in _re.split(r'[/+、，,\s]+', theme1) if len(w) >= 2)
-            words2 = set(w for w in _re.split(r'[/+、，,\s]+', theme2) if len(w) >= 2)
-            return len(words1 & words2) >= min_overlap
-
         kept: List[Dict[str, Any]] = []
         for ins in insights:
             thesis = ins.get("thesis", "")
@@ -1051,29 +1131,10 @@ class AnalysisAgent:
                 continue
             is_dup = False
             for i, existing in enumerate(kept):
-                # 门控: chain_type 不同则跳过 (板块传导 vs 时间线不会重复)
-                ct1 = ins.get("chain_type", "")
-                ct2 = existing.get("chain_type", "")
-                theme1 = ins.get("chain_theme", "")
-                theme2 = existing.get("chain_theme", "")
-                # chain_type 不同，或 theme 无重叠 → 不做文字去重
-                if ct1 != ct2 and not _themes_overlap(theme1, theme2):
-                    continue
-                # theme 无重叠也跳过 (不同主题不应被 thesis 文字合并)
-                if theme1 and theme2 and not _themes_overlap(theme1, theme2):
-                    continue
                 ex_thesis = existing.get("thesis", "")
-                # 方法1: 最长公共子串 >= 25 (只匹配真正相似的论点)
-                if _lcs_len(thesis, ex_thesis) >= 25:
+                # 仅当两个 thesis 有较长公共子串 (>=30字) 才视为重复
+                if _lcs_len(thesis, ex_thesis) >= 30:
                     is_dup = True
-                else:
-                    # 方法2: 3-gram Jaccard >= 0.50
-                    ng1 = _ngrams(thesis)
-                    ng2 = _ngrams(ex_thesis)
-                    if ng1 and ng2:
-                        jaccard = len(ng1 & ng2) / len(ng1 | ng2)
-                        if jaccard >= 0.50:
-                            is_dup = True
                 if is_dup:
                     if ins.get("confidence", 0) > existing.get("confidence", 0):
                         kept[i] = ins

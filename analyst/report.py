@@ -56,10 +56,10 @@ REPORT_TEMPLATE = """\
 
 ## 分析概要
 
-| # | 核心论点 | 置信度 | 时间维度 | 未定价信号 | 链类型 |
-|---|---------|-------|---------|-----------|--------|
+| # | 核心论点 | 置信度 | 时间维度 | 未定价信号 | 链类型 | 消息日期 |
+|---|---------|-------|---------|-----------|--------|---------|
 {%- for ins in insights %}
-| {{ loop.index }} | {{ ins.get("thesis", "")[:50] }} | {{ "%.0f" | format(ins.get("confidence", 0) * 100) }}% | {{ ins.get("time_horizon", "-") }} | {{ ins.get("hidden_signals", []) | selectattr("not_priced_in") | list | length }} | {{ ins.get("chain_type", "-") }} |
+| {{ loop.index }} | {{ ins.get("thesis", "")[:50] }} | {{ "%.0f" | format(ins.get("confidence", 0) * 100) }}% | {{ ins.get("time_horizon", "-") }} | {{ ins.get("hidden_signals", []) | selectattr("not_priced_in") | list | length }} | {{ ins.get("chain_type", "-") }} | {{ ins.get("news_date_range", "-") }} |
 {%- endfor %}
 
 ---
@@ -87,8 +87,14 @@ REPORT_TEMPLATE = """\
 
 ### 核心发现
 {%- for finding in ins.get("key_findings", []) %}
+{%- set _ev_dates = [] %}
+{%- for eid in finding.get("evidence_ids", []) %}
+{%- if eid in news_map and news_map[eid].get("time", "") %}
+{%- if _ev_dates.append(news_map[eid]["time"][:10]) %}{% endif %}
+{%- endif %}
+{%- endfor %}
 
-{{ loop.index }}. **{{ finding.get("finding", "") }}**
+{{ loop.index }}. **{{ finding.get("finding", "") }}**{% if _ev_dates %} ({{ _ev_dates | unique | join(', ') }}){% endif %}
    - 推导逻辑: {{ finding.get("reasoning", "") }}
 {%- endfor %}
 
@@ -141,7 +147,7 @@ REPORT_TEMPLATE = """\
   - 目标: {{ item.get("targets", []) | join(", ") }}
 {%- endif %}
 {%- for tr in item.get("target_reasons", []) %}
-  - **{{ tr.get("code", "") }}**: {{ tr.get("reason", "") }}{% if tr.get("actual_name") %}（实际: {{ tr.get("actual_name") }}{% if tr.get("actual_industry") %}，{{ tr.get("actual_industry") }}{% endif %}）{% endif %}
+  - **{{ tr.get("code", "") }}**: {{ tr.get("reason", "") }}{% if tr.get("actual_name") %}（实际: {{ tr.get("actual_name") }}{% if tr.get("actual_industry") %}，{{ tr.get("actual_industry") }}{% endif %}）{% endif %}{% if tr.get("business_match") == false %} ⚠️ 跨界经营{% endif %}
 {%- if tr.get("main_business") %}
     - 主营业务: {{ tr.get("main_business", "") }}{% if tr.get("actual_industry") and tr.get("actual_industry") not in tr.get("main_business", "") %} ⚠️ 实际行业: {{ tr.get("actual_industry") }}{% endif %}
 {%- endif %}
@@ -200,6 +206,21 @@ REPORT_TEMPLATE = """\
 - **幻觉标记**: {{ ctx.evaluation.get("hallucination_count", 0) }}
 - **修正策略**: {{ ctx.refinement_strategy or "无" }}
 
+{% if chain_utilization %}
+## 线索链利用效率
+
+> 衡量数据到线索链的转化效率，以及多维度线索的交叉利用情况
+
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| 数据利用率 | {{ "%.1f" | format(chain_utilization["data_utilization_rate"] * 100) }}% | 扫描 {{ chain_utilization["total_news_scanned"] }} 条新闻，{{ chain_utilization["unique_nodes_in_chains"] }} 条被纳入线索链 |
+| 链类型覆盖 | {{ "%.1f" | format(chain_utilization["chain_type_coverage"] * 100) }}% | 激活 {{ chain_utilization["chain_types_activated"] }}/{{ chain_utilization["chain_types_total"] }} 种链类型 |
+| 跨链复用 | {{ "%.1f" | format(chain_utilization["cross_chain_reuse"] * 100) }}% | {{ chain_utilization["cross_chain_reuse_count"] }} 条新闻被 2+ 条链引用 |
+| 信号深度 | {{ "%.1f" | format(chain_utilization["signal_depth"] * 100) }}% | {{ chain_utilization["insights_multi_chain"] }}/{{ chain_utilization["total_insights"] }} 条洞察有 2+ 种链类型支撑 |
+| 节点覆盖率 | {{ "%.1f" | format(chain_utilization["node_coverage_rate"] * 100) }}% | {{ chain_utilization["nodes_cited_in_insights"] }}/{{ chain_utilization["unique_nodes_in_chains"] }} 个链节点被洞察引用 |
+| **综合效率** | **{{ "%.1f" | format(chain_utilization["overall_efficiency"] * 100) }}%** | 加权综合评分 |
+
+{% endif %}
 {% if ctx.errors %}
 ## 错误记录
 
@@ -237,6 +258,69 @@ REPORT_TEMPLATE = """\
 """
 
 
+def _compute_news_date_ranges(
+    insights: List[Dict],
+    chains: List[Dict],
+) -> None:
+    """为每条 insight 计算 news_date_range (消息源日期范围)
+
+    同时设置 _sort_start_date 供后续按起始日期降序排列。
+    优先从 time_span 取；fallback 从链节点时间推算。
+    """
+    # chain_id → 节点时间列表
+    chain_times: Dict[str, List[str]] = {}
+    for chain in chains:
+        cid = chain.get("chain_id", "")
+        times = []
+        for node in chain.get("nodes", []):
+            t = node.get("time", "") or node.get("publish_time", "")
+            if t:
+                times.append(t[:10])
+        if cid:
+            chain_times[cid] = sorted(set(times))
+
+    for ins in insights:
+        start = ""
+        end = ""
+
+        # 1. 优先用 time_span (格式 "2025-05-01 ~ 2025-05-17")
+        ts = ins.get("time_span", "")
+        if " ~ " in ts:
+            parts = ts.split(" ~ ")
+            start = parts[0].strip()[:10]
+            end = parts[1].strip()[:10] if len(parts) > 1 else ""
+
+        # 2. fallback: 从链节点取
+        if not start:
+            cid = ins.get("chain_id", "")
+            ctimes = chain_times.get(cid, [])
+            if ctimes:
+                start = ctimes[0]
+                end = ctimes[-1]
+
+        if start and end:
+            ins["news_date_range"] = f"{start} ~ {end}"
+        elif start:
+            ins["news_date_range"] = start
+        else:
+            ins["news_date_range"] = "-"
+
+        ins["_sort_start_date"] = start
+
+
+def _normalize_stock_code(raw) -> str:
+    """将 targets 中的各种格式统一为字符串代码
+
+    LLM 可能返回:
+      - "000333.SZ" (字符串)
+      - {"code": "000333.SZ", "name": "美的集团"} (dict)
+      - 其他格式
+    """
+    if isinstance(raw, dict):
+        return raw.get("code") or raw.get("ts_code") or str(raw)
+    return str(raw)
+
+
 def _build_stock_ranking(insights: List[Dict]) -> List[Dict]:
     """从所有洞察中汇总推荐股票，按频次×置信度排名"""
     stocks: Dict[str, Dict] = {}
@@ -253,7 +337,10 @@ def _build_stock_ranking(insights: List[Dict]) -> List[Dict]:
                 if code:
                     verify_map[code] = vd
 
-            for code in targets:
+            for raw_code in targets:
+                code = _normalize_stock_code(raw_code)
+                if not code or code in ("None", "{}", ""):
+                    continue
                 if code not in stocks:
                     stocks[code] = {
                         "code": code,
@@ -313,6 +400,23 @@ def generate_report(ctx: RunContext, output_dir: str, config=None) -> str:
     insights = ctx.insights or []
     evaluation = ctx.evaluation or {}
     chains = ctx.chains or []
+
+    # 预处理: 确保 evidence_ids 和 targets 都是字符串 (LLM 可能返回 dict)
+    for ins in insights:
+        for finding in ins.get("key_findings", []):
+            raw_ids = finding.get("evidence_ids", [])
+            finding["evidence_ids"] = [
+                str(e) if not isinstance(e, str) else e for e in raw_ids
+            ]
+        for item in ins.get("actionable_items", []):
+            raw_targets = item.get("targets", [])
+            item["targets"] = [
+                _normalize_stock_code(t) for t in raw_targets
+            ]
+
+    # 计算每条 insight 的消息日期范围，并按起始日期降序排列
+    _compute_news_date_ranges(insights, chains)
+    insights.sort(key=lambda ins: ins.get("_sort_start_date", ""), reverse=True)
 
     # 从链数据构建 news_id → {title, source, time} 映射
     news_map: Dict[str, Dict] = {}
@@ -386,6 +490,9 @@ def generate_report(ctx: RunContext, output_dir: str, config=None) -> str:
         score = evaluation.get(key, 0)
         eval_dims.append((label, score))
 
+    # 线索链利用效率
+    chain_utilization = evaluation.get("chain_utilization")
+
     # A 股散户持仓排名 Top 50
     data_dir_str = str(config.data_dir) if config else None
     try:
@@ -444,6 +551,7 @@ def generate_report(ctx: RunContext, output_dir: str, config=None) -> str:
         tracking_keywords=tracking_keywords,
         tracking_hits=tracking_hits,
         stock_ranking=stock_ranking,
+        chain_utilization=chain_utilization,
     )
 
     filepath.write_text(content, encoding="utf-8")
